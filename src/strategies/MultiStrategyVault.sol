@@ -52,7 +52,7 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         address[] supplyQueue; // Order for deposits into strategies
         address[] withdrawQueue; // Order for withdrawals from strategies
         // Aggregate accounting
-        uint256 totalDebt; // Sum of all currentDebt across strategies
+        uint256 totalAllocated; // Sum of all currentAllocated across strategies
     }
 
     function _getMultiStrategyVaultStorage() private pure returns (MultiStrategyVaultStorage storage S) {
@@ -88,15 +88,15 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     //                                     VIEW FUNCTIONS                                        //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Returns the total debt outstanding across all active child strategies.
-    /// @return Sum of currentDebt recorded for every active strategy.
-    function totalDebt() external view returns (uint256) {
-        return _getMultiStrategyVaultStorage().totalDebt;
+    /// @notice Returns the total assets allocated across all active child strategies.
+    /// @return Sum of currentAllocated recorded for every active strategy.
+    function totalAllocated() external view returns (uint256) {
+        return _getMultiStrategyVaultStorage().totalAllocated;
     }
 
     /// @notice Returns the configuration record for a specific child strategy.
     /// @param strategy Address of the child strategy.
-    /// @return The StrategyConfig struct storing allocation cap, current debt, and activation timestamp.
+    /// @return The StrategyConfig struct storing allocation cap, current allocation, and activation timestamp.
     function getStrategyConfig(address strategy) external view returns (StrategyConfig memory) {
         return _getMultiStrategyVaultStorage().strategyConfig[strategy];
     }
@@ -132,7 +132,7 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
 
         S.strategyConfig[strategy] = StrategyConfig({
             allocationCap: 0,
-            currentDebt: 0,
+            currentAllocated: 0,
             activatedAt: uint64(block.timestamp),
             lastReport: uint64(block.timestamp)
         });
@@ -144,14 +144,14 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     }
 
     /// @notice Remove a child strategy from the vault.
-    /// @dev Strategy must have zero debt (all funds deallocated and claimed).
+    /// @dev Strategy must have zero allocation (all funds deallocated and claimed).
     /// @param strategy Address of the strategy to remove.
     function removeStrategy(address strategy) external nonReentrant onlyRole(MANAGEMENT_ROLE) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
 
         StrategyConfig storage config = S.strategyConfig[strategy];
         if (config.activatedAt == 0) revert LibError.StrategyNotActive();
-        if (config.currentDebt != 0) revert LibError.StrategyHasDebt();
+        if (config.currentAllocated != 0) revert LibError.StrategyHasAllocation();
 
         // Ensure we don't hold any shares of the strategy (no active, pending or claimable shares)
         if (IERC20(strategy).balanceOf(address(this)) != 0) revert LibError.StrategyHasPendingRequest();
@@ -230,16 +230,16 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         if (assets > availableAssets) revert LibError.InsufficientAvailableAssets();
 
         // Enforce allocation cap
-        uint256 newDebt = uint256(config.currentDebt) + assets;
-        if (newDebt > config.allocationCap) revert LibError.ExceedsAllocationCap();
+        uint256 newAllocation = uint256(config.currentAllocated) + assets;
+        if (newAllocation > config.allocationCap) revert LibError.ExceedsAllocationCap();
 
         // Deposit into the child strategy
         IERC20(asset()).forceApprove(strategy, assets);
         uint256 sharesReceived = IERC4626(strategy).deposit(assets, address(this));
 
         // Update accounting
-        config.currentDebt = newDebt.toUint128();
-        S.totalDebt += assets;
+        config.currentAllocated = newAllocation.toUint128();
+        S.totalAllocated += assets;
 
         emit FundsAllocated(strategy, assets, sharesReceived);
     }
@@ -283,12 +283,12 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         uint256 sharesToRedeem = userRequest.shares;
         assets = IERC4626(strategy).redeem(sharesToRedeem, address(this), address(this));
 
-        // Update debt accounting
-        uint256 debtReduction = Math.min(uint256(config.currentDebt), assets);
-        config.currentDebt -= debtReduction.toUint128();
-        S.totalDebt -= debtReduction;
+        // Update allocation accounting
+        uint256 allocationReduction = Math.min(uint256(config.currentAllocated), assets);
+        config.currentAllocated -= allocationReduction.toUint128();
+        S.totalAllocated -= allocationReduction;
 
-        // If we received more assets than the debt reduction (e.g. from yield already accrued),
+        // If we received more assets than the allocation reduction (e.g. from yield already accrued),
         // the excess naturally increases idle balance and will be picked up in the next report
 
         emit FundsClaimed(strategy, assets, sharesToRedeem);
@@ -298,9 +298,9 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     //                              REPORTING (KEEPER_ROLE)                                      //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Report the current value of a child strategy and update debt accounting.
+    /// @notice Report the current value of a child strategy and update allocation accounting.
     /// @dev Reads the strategy's convertToAssets for the vault's share position and
-    ///      adjusts currentDebt accordingly. This updates totalAssets without moving funds.
+    ///      adjusts currentAllocated accordingly. This updates totalAssets without moving funds.
     /// @param strategy Address of the strategy to report.
     function reportStrategy(address strategy) external nonReentrant onlyRole(KEEPER_ROLE) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
@@ -330,21 +330,21 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
             actualValue = IERC4626(strategy).convertToAssets(sharesOwned);
         }
 
-        // Update strategy specific debt
-        uint256 previousDebt = config.currentDebt;
-        config.currentDebt = actualValue.toUint128();
+        // Update strategy specific allocation
+        uint256 previousAllocated = config.currentAllocated;
+        config.currentAllocated = actualValue.toUint128();
         config.lastReport = uint64(block.timestamp);
 
-        // Update aggregate totalDebt
-        if (actualValue > previousDebt) {
-            uint256 profit = actualValue - previousDebt;
-            S.totalDebt += profit;
-        } else if (actualValue < previousDebt) {
-            uint256 loss = previousDebt - actualValue;
-            S.totalDebt -= loss;
+        // Update aggregate totalAllocated
+        if (actualValue > previousAllocated) {
+            uint256 profit = actualValue - previousAllocated;
+            S.totalAllocated += profit;
+        } else if (actualValue < previousAllocated) {
+            uint256 loss = previousAllocated - actualValue;
+            S.totalAllocated -= loss;
         }
 
-        emit StrategyReportedFromVault(strategy, previousDebt, actualValue);
+        emit StrategyReportedFromVault(strategy, previousAllocated, actualValue);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -361,14 +361,14 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         address strategy = S.supplyQueue[0];
         StrategyConfig storage config = S.strategyConfig[strategy];
 
-        uint256 currentDebt = config.currentDebt;
+        uint256 currentAllocated = config.currentAllocated;
         uint256 cap = config.allocationCap;
 
         // Skip if strategy is at or above cap
-        if (currentDebt >= cap) return;
+        if (currentAllocated >= cap) return;
 
         // Respect both allocation cap and child strategy's deposit limit
-        uint256 capRoom = cap - currentDebt;
+        uint256 capRoom = cap - currentAllocated;
         uint256 strategyRoom = IERC4626(strategy).maxDeposit(address(this));
         uint256 toAllocate = Math.min(_amount, Math.min(capRoom, strategyRoom));
 
@@ -377,8 +377,8 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         IERC20(asset()).forceApprove(strategy, toAllocate);
         IERC4626(strategy).deposit(toAllocate, address(this));
 
-        config.currentDebt = (currentDebt + toAllocate).toUint128();
-        S.totalDebt += toAllocate;
+        config.currentAllocated = (currentAllocated + toAllocate).toUint128();
+        S.totalAllocated += toAllocate;
 
         emit FundsAllocated(strategy, toAllocate, 0);
     }
@@ -412,16 +412,24 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         return 0;
     }
 
-    /// @dev Computes the total assets held by this vault: idle balance + totalDebt across strategies.
-    ///      Uses the accounting-tracked totalDebt rather than live on-chain queries for gas efficiency.
-    ///      The keeper should call reportStrategy() beforehand to keep totalDebt accurate.
+    /// @dev Computes the total assets held by this vault: idle balance + totalAllocated across strategies.
+    /// @dev NOTE: Actively subtracts the `withdrawalReserve()` from the raw idle balance.
+    /// Because pending share claims are finalized into this reserve, including it in equity
+    /// calculations would falsely inflate total vault assets.
+    /// Uses the accounting-tracked totalAllocated rather than live on-chain queries for gas efficiency.
+    /// The keeper should call reportStrategy() beforehand to keep totalAllocated accurate.
     function _reportTotalAssets() internal view virtual override returns (uint256 _totalAssets) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
 
         // Raw vault balance (includes withdrawal reserve)
-        uint256 vaultBalance = _getSelfBalance(IERC20(asset()));
+        uint256 grossIdle = _getSelfBalance(IERC20(asset()));
+        uint128 reserve = withdrawalReserve();
 
-        _totalAssets = vaultBalance + S.totalDebt;
+        // Actively strip out `withdrawalReserve` so that pending share claims held in
+        // the vault don't factor back into total vault equity and dilute yields.
+        uint256 activeIdle = grossIdle > reserve ? grossIdle - reserve : 0;
+
+        _totalAssets = activeIdle + S.totalAllocated;
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////

@@ -18,7 +18,6 @@ interface ICeresBaseVault is IERC4626 {
 
     event RequestProcessed(uint256 indexed requestId, uint256 totalShares, uint256 pricePerShare);
     event StrategyReported(address indexed keeper, uint256 profit, uint256 loss, uint256 performanceFees);
-    event WithdrawalReserveUpdated(uint128 _withdrawalReserve);
 
     event ConfigUpdated();
 
@@ -104,6 +103,4 @@ interface ICeresBaseVault is IERC4626 {
     ) external;
 
     function setDepositWithdrawLimits(uint128 _depositLimit, uint128 _redeemLimit, uint96 _minDepositAmount) external;
-
-    function setWithdrawalReserve(uint128 _withdrawalReserve) external;
 }

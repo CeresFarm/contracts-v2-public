@@ -35,7 +35,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         assertEq(vault.asset(), address(asset), "asset mismatch");
         assertEq(vault.totalAssets(), 0, "totalAssets should be 0");
         assertEq(vault.totalSupply(), 0, "totalSupply should be 0");
-        assertEq(vault.totalDebt(), 0, "totalDebt should be 0");
+        assertEq(vault.totalAllocated(), 0, "totalAllocated should be 0");
         assertEq(vault.currentRequestId(), 1, "first requestId should be 1");
     }
 
@@ -45,8 +45,8 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
 
         assertGt(configA.activatedAt, 0, "childA should be active");
         assertGt(configB.activatedAt, 0, "childB should be active");
-        assertEq(configA.currentDebt, 0, "childA debt should be 0");
-        assertEq(configB.currentDebt, 0, "childB debt should be 0");
+        assertEq(configA.currentAllocated, 0, "childA allocated should be 0");
+        assertEq(configB.currentAllocated, 0, "childB allocated should be 0");
         assertEq(configA.allocationCap, ALLOCATION_CAP_A, "childA cap mismatch");
         assertEq(configB.allocationCap, ALLOCATION_CAP_B, "childB cap mismatch");
     }
@@ -146,7 +146,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         // childA now has debt from auto-allocation
 
         vm.prank(management);
-        vm.expectRevert(LibError.StrategyHasDebt.selector);
+        vm.expectRevert(LibError.StrategyHasAllocation.selector);
         vault.removeStrategy(address(childA));
     }
 
@@ -237,7 +237,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         vm.prank(management);
         vault.setAllocationCap(address(childA), ALLOCATION_CAP_A);
 
-        uint256 preDebt = vault.totalDebt();
+        uint256 preAlloc = vault.totalAllocated();
 
         vm.expectEmit(true, false, false, false);
         emit FundsAllocated(address(childA), allocAmount, 0); // shares not checked
@@ -245,8 +245,8 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         _allocateToChild(address(childA), allocAmount);
 
         IMultiStrategyVault.StrategyConfig memory config = vault.getStrategyConfig(address(childA));
-        assertEq(config.currentDebt, allocAmount, "childA currentDebt should equal allocated assets");
-        assertEq(vault.totalDebt(), preDebt + allocAmount, "totalDebt should increase");
+        assertEq(config.currentAllocated, allocAmount, "childA currentAllocated should equal allocated assets");
+        assertEq(vault.totalAllocated(), preAlloc + allocAmount, "totalAllocated should increase");
 
         // The vault must have approved and transferred tokens to childA
         assertEq(asset.balanceOf(address(vault)), depositAmount - allocAmount, "vault idle should decrease");
@@ -260,7 +260,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         _reportStrategy(address(childA));
         _harvestVault();
 
-        // totalAssets = idle (0) + totalDebt (depositAmount)
+        // totalAssets = idle (0) + totalAllocated (depositAmount)
         assertApproxEqAbs(vault.totalAssets(), depositAmount, 1, "totalAssets should be unchanged after auto-allocate");
     }
 
@@ -363,8 +363,8 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         assertEq(asset.balanceOf(address(vault)), preVaultBalance + assets, "vault idle should increase");
 
         IMultiStrategyVault.StrategyConfig memory config = vault.getStrategyConfig(address(childA));
-        assertEq(config.currentDebt, 0, "childA debt should be 0 after full deallocation");
-        assertEq(vault.totalDebt(), 0, "totalDebt should be 0 after full deallocation");
+        assertEq(config.currentAllocated, 0, "childA allocated should be 0 after full deallocation");
+        assertEq(vault.totalAllocated(), 0, "totalAllocated should be 0 after full deallocation");
     }
 
     function testRevert_ClaimDeallocated_ZeroShares() public {
@@ -389,18 +389,18 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         _depositToVault(user1, depositAmount);
         // Funds auto-allocated to childA
 
-        uint256 debtBefore = vault.getStrategyConfig(address(childA)).currentDebt;
+        uint256 allocBefore = vault.getStrategyConfig(address(childA)).currentAllocated;
 
         vm.expectEmit(true, false, false, false);
         emit StrategyReportedFromVault(address(childA), 0, 0); // values not checked
 
         _reportStrategy(address(childA));
 
-        uint256 debtAfter = vault.getStrategyConfig(address(childA)).currentDebt;
-        assertApproxEqAbs(debtAfter, debtBefore, 1, "debt should be unchanged with no yield");
+        uint256 allocAfter = vault.getStrategyConfig(address(childA)).currentAllocated;
+        assertApproxEqAbs(allocAfter, allocBefore, 1, "allocated should be unchanged with no yield");
     }
 
-    function test_ReportStrategy_YieldIncreasesTotalDebt() public {
+    function test_ReportStrategy_YieldIncreasesTotalAllocated() public {
         uint256 depositAmount = 10_000 * 1e6;
         _depositToVault(user1, depositAmount);
         // Funds auto-allocated to childA
@@ -414,10 +414,10 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         vm.prank(keeper);
         childA.harvestAndReport();
 
-        uint256 totalDebtBefore = vault.totalDebt();
+        uint256 totalAllocatedBefore = vault.totalAllocated();
         _reportStrategy(address(childA));
 
-        assertGt(vault.totalDebt(), totalDebtBefore, "totalDebt should increase after yield");
+        assertGt(vault.totalAllocated(), totalAllocatedBefore, "totalAllocated should increase after yield");
     }
 
     function testRevert_ReportStrategy_NotActive() public {
@@ -513,7 +513,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         assertEq(vault.balanceOf(user1), userShares, "user should hold shares");
 
         // 2. Verify auto-allocation sent funds to childA
-        assertEq(vault.totalDebt(), depositAmount, "totalDebt should match deposit (auto-allocated)");
+        assertEq(vault.totalAllocated(), depositAmount, "totalAllocated should match deposit (auto-allocated)");
         assertEq(asset.balanceOf(address(vault)), 0, "vault should have no idle after auto-allocation");
 
         // 3. User requests redeem (all shares)
@@ -609,10 +609,10 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         // overstating the debt.
         IMultiStrategyVault.StrategyConfig memory config = vault.getStrategyConfig(address(childA));
         assertApproxEqAbs(
-            config.currentDebt,
+            config.currentAllocated,
             depositAmount,
-            1,
-            "currentDebt should reflect locked-in PPS, not inflated convertToAssets"
+            1e15,
+            "currentAllocated should reflect locked-in PPS, not inflated convertToAssets"
         );
     }
 
@@ -636,12 +636,12 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
 
         IMultiStrategyVault.StrategyConfig memory config = vault.getStrategyConfig(address(childA));
         // convertToAssets includes the yield, so debt should be higher than depositAmount
-        assertGt(config.currentDebt, depositAmount, "currentDebt should include yield via convertToAssets");
+        assertGt(config.currentAllocated, depositAmount, "currentAllocated should include yield via convertToAssets");
         assertApproxEqAbs(
-            config.currentDebt,
+            config.currentAllocated,
             depositAmount + yieldAmount,
             2,
-            "currentDebt should reflect full value including yield"
+            "currentAllocated should reflect full value including yield"
         );
     }
 
