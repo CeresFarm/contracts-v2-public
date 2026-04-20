@@ -79,7 +79,7 @@ library LibError {
     error MaxQueueLengthExceeded();
     error StrategyAlreadyActive();
     error StrategyAssetMismatch();
-    error StrategyHasDebt();
+    error StrategyHasAllocation();
     error StrategyHasPendingRequest();
     error StrategyNotActive();
 }

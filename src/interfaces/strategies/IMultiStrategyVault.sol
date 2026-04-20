@@ -10,7 +10,7 @@ interface IMultiStrategyVault is ICeresBaseVault {
 
     struct StrategyConfig {
         uint128 allocationCap; // Max assets that can be allocated to this strategy
-        uint128 currentDebt; // Current assets allocated to this strategy
+        uint128 currentAllocated; // Current assets allocated to this strategy
         uint64 activatedAt; // Timestamp when strategy was added (0 = inactive)
         uint64 lastReport; // Timestamp of last report
     }
@@ -34,7 +34,7 @@ interface IMultiStrategyVault is ICeresBaseVault {
     //                                    VIEW FUNCTIONS                                         //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function totalDebt() external view returns (uint256);
+    function totalAllocated() external view returns (uint256);
     function getStrategyConfig(address strategy) external view returns (StrategyConfig memory);
     function getSupplyQueue() external view returns (address[] memory);
     function getWithdrawQueue() external view returns (address[] memory);
