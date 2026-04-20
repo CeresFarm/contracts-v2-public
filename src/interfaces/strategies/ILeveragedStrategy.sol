@@ -72,6 +72,10 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
             address flashLoanRouter
         );
 
+    /// @notice Returns a full breakdown of the strategy's net asset value.
+    /// @dev NOTE: It MUST strictly deduct `withdrawalReserve()` from actually held gross
+    /// assets to ensure pending withdrawers' liquidity isn't mixed into total equity
+    /// calculations, preventing yield dilution attacks.
     function getNetAssets()
         external
         view

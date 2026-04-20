@@ -460,10 +460,19 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         uint256 requestId = _requestRedeemAs(user1, sharesToRedeem);
         console.log("Request ID ", requestId);
 
+        uint256 strategySharesBeforeProcess = strategy.balanceOf(address(strategy));
+
         _processCurrentRequest();
 
         uint256 reserveBefore = strategy.withdrawalReserve();
-        uint256 strategySharesBefore = strategy.balanceOf(address(strategy));
+        uint256 strategySharesAfterProcess = strategy.balanceOf(address(strategy));
+
+        // Verify shares were correctly burned from strategy during processing, not during redeem
+        assertEq(
+            strategySharesAfterProcess,
+            strategySharesBeforeProcess - sharesToRedeem,
+            "Shares should be burned from strategy during processing"
+        );
 
         // Complete redeem
         uint256 assetsReceived = _redeemAs(user1, sharesToRedeem);
@@ -472,11 +481,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         assertGt(assetsReceived, 0, "Should receive assets");
         assertApproxEqRel(assetsReceived, depositAmount / 2, 1e15, "Should receive ~half of deposit");
 
-        // Verify shares burned from strategy
         assertEq(
             strategy.balanceOf(address(strategy)),
-            strategySharesBefore - sharesToRedeem,
-            "Shares should be burned from strategy"
+            0,
+            "Strategy should have 0 shares after processing and claim"
         );
 
         // Verify withdrawal reserve decreased

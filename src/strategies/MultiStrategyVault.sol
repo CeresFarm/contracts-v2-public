@@ -413,15 +413,23 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     }
 
     /// @dev Computes the total assets held by this vault: idle balance + totalDebt across strategies.
-    ///      Uses the accounting-tracked totalDebt rather than live on-chain queries for gas efficiency.
-    ///      The keeper should call reportStrategy() beforehand to keep totalDebt accurate.
+    /// @dev NOTE: Actively subtracts the `withdrawalReserve()` from the raw idle balance.
+    /// Because pending share claims are finalized into this reserve, including it in equity
+    /// calculations would falsely inflate total vault assets.
+    /// Uses the accounting-tracked totalDebt rather than live on-chain queries for gas efficiency.
+    /// The keeper should call reportStrategy() beforehand to keep totalDebt accurate.
     function _reportTotalAssets() internal view virtual override returns (uint256 _totalAssets) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
 
         // Raw vault balance (includes withdrawal reserve)
-        uint256 vaultBalance = _getSelfBalance(IERC20(asset()));
+        uint256 grossIdle = _getSelfBalance(IERC20(asset()));
+        uint128 reserve = withdrawalReserve();
 
-        _totalAssets = vaultBalance + S.totalDebt;
+        // Actively strip out `withdrawalReserve` so that pending share claims held in
+        // the vault don't factor back into total vault equity and dilute yields.
+        uint256 activeIdle = grossIdle > reserve ? grossIdle - reserve : 0;
+
+        _totalAssets = activeIdle + S.totalDebt;
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////

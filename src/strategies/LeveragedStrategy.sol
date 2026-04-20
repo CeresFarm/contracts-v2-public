@@ -242,9 +242,12 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice Returns a full breakdown of the strategy's net asset value.
+    /// @dev NOTE:When calculating `assetBalance` and `netAssets`, this function strictly
+    /// deducts `withdrawalReserve()` from the actually held gross assets to prevent locked assets from
+    /// pending withdrawals from inflating share prices
     /// @dev All amounts are in their respective token decimals. Debt token balance offsets market debt.
-    /// @return assetBalance Current idle balance of the asset token held by this contract.
-    /// @return netAssets Net asset value in asset-token terms (collateral value + asset balance - net debt).
+    /// @return assetBalance Current idle balance of the asset token held by this contract (minus reserve).
+    /// @return netAssets Net asset value in asset-token terms (collateral value + net asset balance - net debt).
     /// @return marketCollateral Collateral deposited into the lending market.
     /// @return totalCollateral Total collateral including any balance held by the contract.
     /// @return marketDebt Outstanding debt in the lending market.
@@ -271,7 +274,12 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         marketCollateral = _getCollateralAmount();
         marketDebt = _getDebtAmount();
 
-        assetBalance = _getSelfBalance(IERC20(assetToken));
+        uint128 reserve = withdrawalReserve();
+        uint256 grossAssetBalance = _getSelfBalance(IERC20(assetToken));
+
+        // By actively subtracting `withdrawalReserve` from our actually held gross assets,
+        // we ensure pending withdrawals liquidity isn't mixed back into share price calculations.
+        assetBalance = grossAssetBalance > reserve ? grossAssetBalance - reserve : 0;
 
         if (S.isAssetCollateral) {
             // If asset and collateral token are the same, assetToken == collateralToken

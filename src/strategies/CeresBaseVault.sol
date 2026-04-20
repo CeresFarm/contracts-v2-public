@@ -508,7 +508,19 @@ abstract contract CeresBaseVault is
         if (pps == 0) revert LibError.ExceededMaxLoss();
 
         request.pricePerShare = pps.toUint128();
-        S.withdrawalReserve += assetsAllocatedForRequest.toUint128();
+
+        // Calculate the exact assets required to pay out all shares at the floor-rounded PPS.
+        // Adding `assetsAllocatedForRequest` directly would trap up to `totalShares / 10**decimals`
+        // in the reserve due to truncation (which can be meaningful for low-decimal tokens like USDC).
+        // By adding only `exactRequiredAssets`, the dust remains in `totalAssets` as profit.
+        uint256 exactRequiredAssets = uint256(request.totalShares).mulDiv(pps, 10 ** decimals(), Math.Rounding.Floor);
+        S.withdrawalReserve += exactRequiredAssets.toUint128();
+
+        // The shares for processed requests are burned.
+        // The corresponding assets are tracked (and locked) using `S.withdrawalReserve`
+        // This makes sure both shares and assets are removed from active calculation
+        // as they do not earn yield and are locked at processed price per share.
+        _burn(address(this), request.totalShares);
 
         // requestId cannot realistically overflow uint128, SafeCast.toUint128 is not required here
         S.currentRequestId = uint128(_currentRequestId + 1);
@@ -576,16 +588,6 @@ abstract contract CeresBaseVault is
         S.redeemLimitShares = _redeemLimit;
         S.minDepositAmount = _minDepositAmount;
         emit ConfigUpdated();
-    }
-
-    /// @notice Allows management to manually override the withdrawal reserve.
-    /// @dev Due to ERC4626 floor rounding during batched distributions, minor amounts of asset dust tokens
-    /// can remain trapped in the `withdrawalReserve` when total claimable shares reach zero.
-    /// This function is used to free linearly accumulated lock-up capital back into active yield deployment.
-    function setWithdrawalReserve(uint128 _withdrawalReserve) external virtual onlyRole(MANAGEMENT_ROLE) {
-        CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
-        S.withdrawalReserve = _withdrawalReserve;
-        emit WithdrawalReserveUpdated(_withdrawalReserve);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -728,10 +730,6 @@ abstract contract CeresBaseVault is
     ) internal virtual {
         CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
 
-        // For async withdrawals, the vault tokens are transferred to the vault on redeem request
-        // The shares are burned on withdrawal from the vault contract itself
-        _burn(address(this), shares);
-
         // Check if the contract has enough underlying assets to cover the withdrawal
         uint256 currentAssets = _getSelfBalance(S.asset);
         if (currentAssets < assets) revert LibError.InsufficientAssets();
@@ -742,7 +740,6 @@ abstract contract CeresBaseVault is
             S.userRedeemRequests[owner_].requestId = 0;
         }
 
-        S.totalAssets -= assets;
         S.withdrawalReserve -= assets.toUint128();
 
         S.asset.safeTransfer(receiver, assets);
@@ -950,6 +947,8 @@ abstract contract CeresBaseVault is
     function _deployFunds(uint256 _amount) internal virtual;
 
     /// @dev Returns the current total assets of the vault as computed from the underlying protocol.
+    /// @dev NOTE: MUST report net assets strictly excluding `withdrawalReserve()`.
+    /// The reserve holds finalized, locked funds assigned to pending withdrawals.
     /// @return _totalAssets The newly computed total assets value.
     function _reportTotalAssets() internal virtual returns (uint256 _totalAssets);
 

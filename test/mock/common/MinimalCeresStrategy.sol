@@ -65,7 +65,11 @@ contract MinimalCeresStrategy is LeveragedStrategy {
     /// @dev All assets are idle, total assets equal the vault's own asset balance.
     /// Bypasses getNetAssets() and its oracle dependency entirely.
     function _reportTotalAssets() internal view override returns (uint256) {
-        return IERC20(asset()).balanceOf(address(this));
+        uint256 total = IERC20(asset()).balanceOf(address(this));
+        uint128 reserve = withdrawalReserve();
+
+        // Remove locked `withdrawalReserve` from active total assets
+        return total > reserve ? total - reserve : 0;
     }
 
     /// @dev No leverage to unwind. Returns 0 so processCurrentRequest falls back
