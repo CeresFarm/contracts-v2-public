@@ -128,21 +128,19 @@ contract MorphoTestSetup is LeveragedStrategyBaseSetup {
         router = new UniversalOracleRouter(address(roleManager));
         MorphoOracleRoute morphoRoute = new MorphoOracleRoute(address(morphoOracle), address(sUSDe), address(usdc));
 
-        vm.startPrank(management);
         IUniversalOracleRouter.RouteStep[] memory collToDebt = new IUniversalOracleRouter.RouteStep[](1);
         collToDebt[0] = IUniversalOracleRouter.RouteStep({
             targetToken: address(usdc),
             oracleRoute: address(morphoRoute)
         });
-        router.setRoute(address(sUSDe), address(usdc), collToDebt);
+        _runViaTimelock(address(router), abi.encodeCall(router.setRoute, (address(sUSDe), address(usdc), collToDebt)));
 
         IUniversalOracleRouter.RouteStep[] memory debtToColl = new IUniversalOracleRouter.RouteStep[](1);
         debtToColl[0] = IUniversalOracleRouter.RouteStep({
             targetToken: address(sUSDe),
             oracleRoute: address(morphoRoute)
         });
-        router.setRoute(address(usdc), address(sUSDe), debtToColl);
-        vm.stopPrank();
+        _runViaTimelock(address(router), abi.encodeCall(router.setRoute, (address(usdc), address(sUSDe), debtToColl)));
 
         morphoOracleAdapter = new OracleAdapter(
             address(router),
@@ -174,6 +172,9 @@ contract MorphoTestSetup is LeveragedStrategyBaseSetup {
         roleManager.grantRole(MANAGEMENT_ROLE, management);
         roleManager.grantRole(KEEPER_ROLE, keeper);
         vm.stopPrank();
+
+        // Deploy timelock and grant TIMELOCKED_ADMIN_ROLE to it
+        _deployTimelock();
     }
 
     function _deployStrategy() internal override {
@@ -209,18 +210,19 @@ contract MorphoTestSetup is LeveragedStrategyBaseSetup {
     }
 
     function _initializeStrategy() internal override {
+        // Timelocked setters: route through real TimelockController.
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setSwapper, (address(swapper))));
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setOracleAdapter, (address(morphoOracleAdapter))));
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setFlashLoanRouter, (address(flashLoanRouter))));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver))
+        );
+
+        // Instant setters (MANAGEMENT_ROLE).
         vm.startPrank(management);
-
-        // Set swapper and oracle adapter (executes immediately since current values are address(0))
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, SWAPPER_KEY, address(swapper));
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(morphoOracleAdapter));
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, FLASH_LOAN_ROUTER_KEY, address(flashLoanRouter));
-
-        // Set LTV parameters + fee recipient
-        strategy.updateConfig(MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver);
         strategy.setTargetLtv(TARGET_LTV_BPS, LTV_BUFFER_BPS);
         strategy.setDepositWithdrawLimits(DEPOSIT_LIMIT, REDEEM_LIMIT_SHARES, 0);
-
         vm.stopPrank();
 
         // Approve Morpho market to spend strategy's collateral and debt tokens
@@ -231,8 +233,13 @@ contract MorphoTestSetup is LeveragedStrategyBaseSetup {
     }
 
     function _configureFlashLoanRouter() internal override {
-        vm.prank(management);
-        flashLoanRouter.setFlashConfig(address(strategy), FlashLoanRouter.FlashSource.MORPHO, address(morpho), true);
+        _runViaTimelock(
+            address(flashLoanRouter),
+            abi.encodeCall(
+                flashLoanRouter.setFlashConfig,
+                (address(strategy), FlashLoanRouter.FlashSource.MORPHO, address(morpho), true)
+            )
+        );
     }
 
     function _addProtocolLiquidity() internal override {

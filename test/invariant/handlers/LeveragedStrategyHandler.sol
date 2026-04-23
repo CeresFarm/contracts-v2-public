@@ -6,7 +6,6 @@ import {Test} from "forge-std/Test.sol";
 import {LeverageLib} from "src/libraries/LeverageLib.sol";
 import {CeresBaseVault} from "src/strategies/CeresBaseVault.sol";
 import {LeveragedStrategy} from "src/strategies/LeveragedStrategy.sol";
-import {ILeveragedStrategy} from "src/interfaces/strategies/ILeveragedStrategy.sol";
 
 import {MockERC20} from "../../mock/common/MockERC20.sol";
 import {MockCeresSwapper} from "../../mock/periphery/MockCeresSwapper.sol";
@@ -21,16 +20,6 @@ contract LeveragedStrategyHandler is Test {
     uint256 public constant ACTOR_COUNT = 6;
     uint256 public constant MAX_MINT = 100_000_000 * 1e18;
     uint256 internal constant BPS_PRECISION = 10_000;
-
-    // key constants
-    bytes32 internal constant ORACLE_KEY = keccak256("ORACLE");
-    bytes32 internal constant SWAPPER_KEY = keccak256("SWAPPER");
-    bytes32 internal constant FLASH_LOAN_ROUTER_KEY = keccak256("FLASH_LOAN_ROUTER");
-
-    // key-index mapping (matches ghost_requestedAt array order)
-    uint256 private constant ORACLE_IDX = 0;
-    uint256 private constant SWAPPER_IDX = 1;
-    uint256 private constant FL_ROUTER_IDX = 2;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                         STATE                                             //
@@ -64,10 +53,6 @@ contract LeveragedStrategyHandler is Test {
     /// @notice isAssetCollateral flag captured at construction, must be immutable.
     bool public ghost_initialIsAssetCollateral;
 
-    /// @notice Timestamps at which requestConfigUpdate succeeded for each config key.
-    /// Index 0 = ORACLE, 1 = SWAPPER, 2 = FLASH_LOAN_ROUTER.
-    uint64[3] public ghost_requestedAt;
-
     //  Call counters (coverage diagnostics)
     uint256 public calls_deposit;
     uint256 public calls_requestRedeem;
@@ -80,9 +65,7 @@ contract LeveragedStrategyHandler is Test {
     uint256 public calls_leverageUp;
     uint256 public calls_leverageDown;
     uint256 public calls_setTargetLtv;
-    uint256 public calls_requestConfigUpdate;
-    uint256 public calls_executeConfigUpdate;
-    uint256 public calls_cancelConfigUpdate;
+    uint256 public calls_setConfig;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                CONSTRUCTOR/INITIALIZERS                                   //
@@ -141,14 +124,6 @@ contract LeveragedStrategyHandler is Test {
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
-    }
-
-    /// @dev Resolve keySeed -> (key, index).
-    function _resolveKey(uint256 keySeed) internal pure returns (bytes32 key, uint256 keyIdx) {
-        uint256 which = keySeed % 3;
-        if (which == ORACLE_IDX) return (ORACLE_KEY, ORACLE_IDX);
-        if (which == SWAPPER_IDX) return (SWAPPER_KEY, SWAPPER_IDX);
-        return (FLASH_LOAN_ROUTER_KEY, FL_ROUTER_IDX);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -379,55 +354,21 @@ contract LeveragedStrategyHandler is Test {
         } catch {}
     }
 
-    //  Handler: requestConfigUpdate
-    /// @dev Only acts on keys without a pending update to avoid PendingActionExists reverts.
-    function requestConfigUpdate(uint256 keySeed) external {
-        (bytes32 key, uint256 keyIdx) = _resolveKey(keySeed);
-
-        // Flash loan router is not configured in the invariant test environment;
-        // skip to avoid committing an untested implementation.
-        if (keyIdx == FL_ROUTER_IDX) return;
-
-        // Resolve the known-good implementation for this key.
-        // Management is trusted, only rotate to validated mock adapters.
-        address newAddr = keyIdx == ORACLE_IDX ? oracle : address(swapper);
-
-        // Skip if there's already a pending update for this key.
-        (address pendingImpl, ) = strategy.pendingUpdates(key);
-        if (pendingImpl != address(0)) return;
-
+    //  Handler: setConfigKey
+    /// @dev Calls one of the TIMELOCKED_ADMIN_ROLE-gated direct setters with the
+    ///      known-good mock implementation. Skips FLASH_LOAN_ROUTER because it is
+    ///      not configured in the invariant test environment.
+    function setConfigKey(uint256 keySeed) external {
+        uint256 which = keySeed % 2; // 0 = oracle, 1 = swapper
         vm.prank(management);
-        try strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, key, newAddr) {
-            // Record the timestamp; the timelock invariant asserts readyTimestamp >= this + DELAY.
-            ghost_requestedAt[keyIdx] = uint64(block.timestamp);
-            calls_requestConfigUpdate++;
-        } catch {}
-    }
-
-    //  Handler: executeConfigUpdate
-    function executeConfigUpdate(uint256 keySeed) external {
-        (bytes32 key, ) = _resolveKey(keySeed);
-
-        (address pendingImpl, uint64 readyTimestamp) = strategy.pendingUpdates(key);
-        if (pendingImpl == address(0)) return; // nothing pending
-        if (block.timestamp < readyTimestamp) return; // delay not elapsed
-
-        vm.prank(management);
-        try strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Execute, key, address(0)) {
-            calls_executeConfigUpdate++;
-        } catch {}
-    }
-
-    //  Handler: cancelConfigUpdate
-    function cancelConfigUpdate(uint256 keySeed) external {
-        (bytes32 key, ) = _resolveKey(keySeed);
-
-        (address pendingImpl, ) = strategy.pendingUpdates(key);
-        if (pendingImpl == address(0)) return; // nothing to cancel
-
-        vm.prank(management);
-        try strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, key, address(0)) {
-            calls_cancelConfigUpdate++;
-        } catch {}
+        if (which == 0) {
+            try strategy.setOracleAdapter(oracle) {
+                calls_setConfig++;
+            } catch {}
+        } else {
+            try strategy.setSwapper(address(swapper)) {
+                calls_setConfig++;
+            } catch {}
+        }
     }
 }

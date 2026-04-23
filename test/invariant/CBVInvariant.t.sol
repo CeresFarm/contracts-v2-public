@@ -4,15 +4,16 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 import {CeresBaseVault} from "src/strategies/CeresBaseVault.sol";
 import {RoleManager} from "src/periphery/RoleManager.sol";
-import {ILeveragedStrategy} from "src/interfaces/strategies/ILeveragedStrategy.sol";
 
 import {MockERC20} from "../mock/common/MockERC20.sol";
 import {MinimalCeresStrategy} from "../mock/common/MinimalCeresStrategy.sol";
 import {MinimalOracleAdapter} from "../mock/common/MinimalOracleAdapter.sol";
 import {BaseVaultHandler} from "./handlers/BaseVaultHandler.sol";
+import {TimelockTestHelper} from "../common/TimelockTestHelper.sol";
 
 /// @title CeresBaseVaultInvariant (CBVInvariant)
 /// @notice Invariant test suite for CeresBaseVault vault accounting logic.
@@ -26,7 +27,7 @@ contract CBVInvariant is Test {
 
     bytes32 internal constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
     bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
-    bytes32 internal constant ORACLE_KEY = keccak256("ORACLE");
+    bytes32 internal constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                         STATE                                             //
@@ -43,6 +44,10 @@ contract CBVInvariant is Test {
     RoleManager internal roleManager;
     MinimalCeresStrategy internal strategy;
     BaseVaultHandler internal handler;
+
+    TimelockController internal timelock;
+    TimelockTestHelper internal timelockHelper;
+    uint256 internal constant TIMELOCK_MIN_DELAY = 1 days;
 
     function setUp() public {
         management = makeAddr("management");
@@ -65,6 +70,14 @@ contract CBVInvariant is Test {
         roleManager.grantRole(KEEPER_ROLE, keeper);
         vm.stopPrank();
 
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, management);
+        vm.startPrank(management);
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, address(timelock));
+        // Renounce the constructor-bootstrap grant so management can't bypass the timelock.
+        roleManager.renounceRole(TIMELOCKED_ADMIN_ROLE, management);
+        vm.stopPrank();
+
         // Strategy
         vm.startPrank(management);
         address proxy = Upgrades.deployTransparentProxy(
@@ -79,21 +92,29 @@ contract CBVInvariant is Test {
         vm.stopPrank();
 
         // Strategy configuration
+        // Oracle and config setters are gated by TIMELOCKED_ADMIN_ROLE -> route via timelock.
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setOracleAdapter, (address(oracle))),
+            management
+        );
+
         vm.startPrank(management);
-
-        // Current oracle is address(0) so manageUpdate (request) executes immediately.
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(oracle));
-
         strategy.setDepositWithdrawLimits(
             100_000_000 * 1e18, // depositLimit: 100 M tokens
             type(uint128).max, // redeemLimitShares: unlimited
             0 // minDepositAmount: 1 wei
         );
+        vm.stopPrank();
 
         // Fee config: 15% performance fee, 2% max loss, 0.25% slippage + fee recipient.
-        strategy.updateConfig(25, 1500, 200, feeRecipient);
-
-        vm.stopPrank();
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient)),
+            management
+        );
 
         // Handler
         handler = new BaseVaultHandler(strategy, assetToken, keeper, management, feeRecipient);

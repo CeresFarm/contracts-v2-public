@@ -9,8 +9,11 @@ import {LibError} from "../libraries/LibError.sol";
 /// @title Universal Oracle Router
 /// @notice A common entry point to resolve all oracle quotes
 /// @dev Implements multi-hop routing using configurable `OracleRoute` adapters.
+/// Route updates are gated by `TIMELOCKED_ADMIN_ROLE`. Delay is enforced externally by the
+/// `TimelockController` that holds the role; the router itself stores no pending state.
 contract UniversalOracleRouter is IUniversalOracleRouter {
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
+    bytes32 public constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
     IAccessControlDefaultAdminRules public immutable ROLE_MANAGER;
 
     /// @notice mapping `tokenIn` => `tokenOut` => Array of hops
@@ -63,26 +66,20 @@ contract UniversalOracleRouter is IUniversalOracleRouter {
         return currentAmount;
     }
 
-    /// @notice Configures or replaces the oracle route for a `tokenIn` -> `tokenOut` pair.
-    /// @dev Each step specifies an `OracleRoute` contract and a target token. The final step must resolve to `tokenOut`.
+    /// @notice Sets (or replaces) the route for a `tokenIn` -> `tokenOut` pair.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`. The required delay is enforced by
+    /// the `TimelockController` that holds this role
     /// @param tokenIn Source token address.
     /// @param tokenOut Destination token address.
     /// @param path Ordered array of route steps defining the conversion path.
-    function setRoute(address tokenIn, address tokenOut, RouteStep[] calldata path) external onlyRole(MANAGEMENT_ROLE) {
-        if (path.length == 0) revert LibError.InvalidOracleRoute();
-
-        // Check if final targetToken matches the intended tokenOut mapping
-        if (path[path.length - 1].targetToken != tokenOut) revert LibError.InvalidToken();
-
-        // Clear existing route before update
-        delete _routes[tokenIn][tokenOut];
-
-        for (uint256 i = 0; i < path.length; i++) {
-            if (path[i].oracleRoute == address(0)) revert LibError.InvalidOracleRoute();
-            if (path[i].targetToken == address(0)) revert LibError.InvalidOracleRoute();
-
-            _routes[tokenIn][tokenOut].push(path[i]);
-        }
+    function setRoute(
+        address tokenIn,
+        address tokenOut,
+        RouteStep[] calldata path
+    ) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        _validatePath(tokenOut, path);
+        _writeRoute(tokenIn, tokenOut, path);
+        emit RouteUpdated(tokenIn, tokenOut, path);
     }
 
     /// @notice Returns the configured route steps for a `tokenIn` -> `tokenOut` pair.
@@ -91,5 +88,27 @@ contract UniversalOracleRouter is IUniversalOracleRouter {
     /// @return Array of route steps for this pair.
     function getRoute(address tokenIn, address tokenOut) external view returns (RouteStep[] memory) {
         return _routes[tokenIn][tokenOut];
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                                   INTERNAL HELPERS                                        //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @dev Validates that `path` is a well-formed route ending at `tokenOut`.
+    function _validatePath(address tokenOut, RouteStep[] memory path) internal pure {
+        if (path.length == 0) revert LibError.InvalidOracleRoute();
+        if (path[path.length - 1].targetToken != tokenOut) revert LibError.InvalidToken();
+        for (uint256 i = 0; i < path.length; i++) {
+            if (path[i].oracleRoute == address(0)) revert LibError.InvalidOracleRoute();
+            if (path[i].targetToken == address(0)) revert LibError.InvalidOracleRoute();
+        }
+    }
+
+    /// @dev Clears any existing route for the pair and writes the new one.
+    function _writeRoute(address tokenIn, address tokenOut, RouteStep[] memory path) internal {
+        delete _routes[tokenIn][tokenOut];
+        for (uint256 i = 0; i < path.length; i++) {
+            _routes[tokenIn][tokenOut].push(path[i]);
+        }
     }
 }

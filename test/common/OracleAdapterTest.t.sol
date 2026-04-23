@@ -12,6 +12,8 @@ import {IOracleRoute} from "../../src/interfaces/periphery/IOracleRoute.sol";
 import {RoleManager} from "../../src/periphery/RoleManager.sol";
 import {MockERC20} from "test/mock/common/MockERC20.sol";
 import {LibError} from "../../src/libraries/LibError.sol";
+import {TimelockTestHelper} from "test/common/TimelockTestHelper.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 contract MockOracleRoute is IOracleRoute {
     uint256 public price = 1e18; // Default 1:1
@@ -41,11 +43,25 @@ contract OracleAdapterTest is Test {
     address public admin = address(0xABCD);
 
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
+    bytes32 public constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
+
+    TimelockController public timelock;
+    TimelockTestHelper public timelockHelper;
+    uint256 public constant TIMELOCK_MIN_DELAY = 1 days;
 
     function setUp() public {
         roleManager = new RoleManager(0, admin);
         vm.prank(admin);
         roleManager.grantRole(MANAGEMENT_ROLE, admin);
+
+        // Real timelock contract holds TIMELOCKED_ADMIN_ROLE
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, admin);
+        vm.startPrank(admin);
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, address(timelock));
+        // Renounce the constructor-bootstrap grant so admin can't bypass the timelock.
+        roleManager.renounceRole(TIMELOCKED_ADMIN_ROLE, admin);
+        vm.stopPrank();
 
         router = new UniversalOracleRouter(address(roleManager));
 
@@ -61,26 +77,32 @@ contract OracleAdapterTest is Test {
     }
 
     function _setupRoutes() internal {
-        vm.startPrank(admin);
-
         mockRoute.setPrice(1e18); // Default to a 1:1 price bridging
 
-        // Set path for ROUTER.quote(COLLATERAL, ASSET) and (COLLATERAL, DEBT)
+        // Set path for ROUTER.quote(COLLATERAL, ASSET) and (COLLATERAL, DEBT) via the timelock.
         IUniversalOracleRouter.RouteStep[] memory collToAsset = new IUniversalOracleRouter.RouteStep[](1);
         collToAsset[0] = IUniversalOracleRouter.RouteStep({
             targetToken: address(assetToken),
             oracleRoute: address(mockRoute)
         });
-        router.setRoute(address(collateralToken), address(assetToken), collToAsset);
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (address(collateralToken), address(assetToken), collToAsset)),
+            admin
+        );
 
         IUniversalOracleRouter.RouteStep[] memory collToDebt = new IUniversalOracleRouter.RouteStep[](1);
         collToDebt[0] = IUniversalOracleRouter.RouteStep({
             targetToken: address(debtToken),
             oracleRoute: address(mockRoute)
         });
-        router.setRoute(address(collateralToken), address(debtToken), collToDebt);
-
-        vm.stopPrank();
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (address(collateralToken), address(debtToken), collToDebt)),
+            admin
+        );
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -121,7 +143,8 @@ contract OracleAdapterTest is Test {
             assertApproxEqRel(collConvertedResult, collateralInput, 1e15, "Asymmetrical Reverse Route Issue!");
         } else {
             // For small amounts, we allow a higher absolute slippage due to the nature of inverse quoting and rounding
-            assertApproxEqAbs(collConvertedResult, collateralInput, 1e6, "Asymmetrical Reverse Route Issue!");
+            uint256 maxError = (1e18 / priceChange) + 1;
+            assertApproxEqAbs(collConvertedResult, collateralInput, maxError, "Asymmetrical Reverse Route Issue!");
         }
     }
 

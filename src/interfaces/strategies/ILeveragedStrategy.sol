@@ -22,29 +22,11 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
 
     // Config events
     event TargetLtvUpdated(uint16 newTargetLtv, uint16 newLtvBuffer);
-    event UpdateRequested(bytes32 indexed key, address indexed newAddress, uint256 readyTimestamp);
-    event UpdateExecuted(bytes32 indexed key, address indexed oldAddress, address indexed newAddress);
-    event UpdateCancelled(bytes32 indexed key, address indexed proposedAddress);
+    event OracleAdapterUpdated(address indexed oldAddress, address indexed newAddress);
+    event SwapperUpdated(address indexed oldAddress, address indexed newAddress);
+    event FlashLoanRouterUpdated(address indexed oldAddress, address indexed newAddress);
+    event KeeperDelayUpdated(uint48 oldDelay, uint48 newDelay);
     event SetExactOutSwapEnabled(bool enabled);
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-    //                                         ENUMS                                             //
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-
-    enum UpdateAction {
-        Request,
-        Execute,
-        Cancel
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-    //                                         STRUCTS                                           //
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-
-    struct PendingUpdate {
-        address implementation;
-        uint64 readyTimestamp;
-    }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                    STATE VARIABLES                                        //
@@ -53,8 +35,9 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
     function COLLATERAL_TOKEN() external view returns (IERC20);
     function DEBT_TOKEN() external view returns (IERC20);
 
-    function pendingUpdates(bytes32 key) external view returns (address implementation, uint64 readyTimestamp);
     function oracleAdapter() external view returns (IOracleAdapter);
+
+    function keeperDelay() external view returns (uint48);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                    VIEW FUNCTIONS                                         //
@@ -128,6 +111,9 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
 
     function setExactOutSwapEnabled(bool _enabled) external;
 
-    // Unified 2-step update management
-    function manageUpdate(UpdateAction action, bytes32 key, address newAddress) external;
+    // Direct setters gated by `TIMELOCKED_ADMIN_ROLE` (delay enforced by external TimelockController).
+    function setOracleAdapter(address _oracleAdapter) external;
+    function setSwapper(address _swapper) external;
+    function setFlashLoanRouter(address _flashLoanRouter) external;
+    function setKeeperDelay(uint48 _keeperDelay) external;
 }

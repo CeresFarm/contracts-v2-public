@@ -119,7 +119,10 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
 
     /// @notice Register a new child strategy.
     /// @dev The strategy must use the same underlying asset as this vault.
-    ///      Adds the strategy to both supply and withdraw queues.
+    /// Adds the strategy to both supply and withdraw queues.
+    /// Supply and withdrawal queues are updated using a gas efficient approach,
+    /// the queues must be adjusted manually after adding/removing strategies to ensure
+    ///  the desired allocation/deallocation order.
     /// @param strategy Address of the ERC-7540 child strategy.
     function addStrategy(address strategy) external nonReentrant onlyRole(MANAGEMENT_ROLE) {
         if (strategy == address(0) || strategy == address(this)) revert LibError.InvalidAddress();
@@ -145,6 +148,9 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
 
     /// @notice Remove a child strategy from the vault.
     /// @dev Strategy must have zero allocation (all funds deallocated and claimed).
+    /// Supply and withdrawal queues are updated using a gas efficient approach,
+    /// the queues must be adjusted manually after adding/removing strategies to ensure
+    ///  the desired allocation/deallocation order.
     /// @param strategy Address of the strategy to remove.
     function removeStrategy(address strategy) external nonReentrant onlyRole(MANAGEMENT_ROLE) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
@@ -283,13 +289,8 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         uint256 sharesToRedeem = userRequest.shares;
         assets = IERC4626(strategy).redeem(sharesToRedeem, address(this), address(this));
 
-        // Update allocation accounting
-        uint256 allocationReduction = Math.min(uint256(config.currentAllocated), assets);
-        config.currentAllocated -= allocationReduction.toUint128();
-        S.totalAllocated -= allocationReduction;
-
-        // If we received more assets than the allocation reduction (e.g. from yield already accrued),
-        // the excess naturally increases idle balance and will be picked up in the next report
+        // Update allocation accounting using cuurent valuation
+        _reportStrategy(strategy);
 
         emit FundsClaimed(strategy, assets, sharesToRedeem);
     }
@@ -303,6 +304,11 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     ///      adjusts currentAllocated accordingly. This updates totalAssets without moving funds.
     /// @param strategy Address of the strategy to report.
     function reportStrategy(address strategy) external nonReentrant onlyRole(KEEPER_ROLE) {
+        _reportStrategy(strategy);
+    }
+
+    /// @dev Internal reporting logic to update allocation accounting.
+    function _reportStrategy(address strategy) internal {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
         StrategyConfig storage config = S.strategyConfig[strategy];
         if (config.activatedAt == 0) revert LibError.StrategyNotActive();

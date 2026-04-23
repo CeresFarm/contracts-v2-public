@@ -10,13 +10,10 @@ library LibError {
     error InvalidAddress();
     error InvalidAmount();
     error InvalidInitiator();
-    error InvalidKey();
     error InvalidReceiver();
     error InvalidToken();
     error InvalidValue();
     error NotImplemented();
-    error NotReady();
-    error NoPendingActionExists();
     error PendingActionExists();
     error RoleManagerNotSet();
     error Unauthorized();
@@ -63,12 +60,14 @@ library LibError {
     error AboveMaxLtv();
     error InvalidLtv();
     error InvalidMarket();
+    error KeeperDelayNotElapsed();
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                        FLASH LOAN                                         //
     ///////////////////////////////////////////////////////////////////////////////////////////////
     error FlashLoanFailed();
     error InvalidFlashLoanProvider();
+    error UnexpectedCallback();
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                     MULTI-STRATEGY VAULT                                  //

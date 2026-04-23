@@ -10,6 +10,8 @@ import {IOracleRoute} from "src/interfaces/periphery/IOracleRoute.sol";
 import {RoleManager} from "src/periphery/RoleManager.sol";
 import {MockERC20} from "test/mock/common/MockERC20.sol";
 import {LibError} from "src/libraries/LibError.sol";
+import {TimelockTestHelper} from "test/common/TimelockTestHelper.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 contract MockOracleRoute is IOracleRoute {
     uint256 public price;
@@ -48,11 +50,26 @@ contract UniversalOracleRouterTest is Test {
     address public owner = address(0xABCD);
 
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
+    bytes32 public constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
+
+    TimelockController public timelock;
+    TimelockTestHelper public timelockHelper;
+    uint256 public constant TIMELOCK_MIN_DELAY = 1 days;
 
     function setUp() public {
         roleManager = new RoleManager(0, owner);
         vm.prank(owner);
         roleManager.grantRole(MANAGEMENT_ROLE, owner);
+
+        // Deploy real timelock and grant it the TIMELOCKED_ADMIN_ROLE so route updates
+        // exercise the production schedule -> wait -> execute path.
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, owner);
+        vm.startPrank(owner);
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, address(timelock));
+        // Renounce the constructor-bootstrap grant so owner can't bypass the timelock.
+        roleManager.renounceRole(TIMELOCKED_ADMIN_ROLE, owner);
+        vm.stopPrank();
 
         router = new UniversalOracleRouter(address(roleManager));
 
@@ -62,6 +79,16 @@ contract UniversalOracleRouterTest is Test {
 
         mockRouteAB = new MockOracleRoute();
         mockRouteBC = new MockOracleRoute();
+    }
+
+    /// @dev Routes a setRoute call through the real timelock, pranking `owner` as proposer/executor.
+    function _setRoute(address tokenIn, address tokenOut, IUniversalOracleRouter.RouteStep[] memory path) internal {
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (tokenIn, tokenOut, path)),
+            owner
+        );
     }
 
     /// @notice Test Track 1: First principles valid quote logic (fuzzing)
@@ -74,8 +101,7 @@ contract UniversalOracleRouterTest is Test {
         IUniversalOracleRouter.RouteStep[] memory path = new IUniversalOracleRouter.RouteStep[](1);
         path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(mockRouteAB)});
 
-        vm.prank(owner);
-        router.setRoute(address(tokenA), address(tokenB), path);
+        _setRoute(address(tokenA), address(tokenB), path);
 
         uint256 result = router.quote(address(tokenA), address(tokenB), amountIn);
         uint256 expected = (amountIn * 2e8) / 1e8;
@@ -98,8 +124,7 @@ contract UniversalOracleRouterTest is Test {
         path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(mockRouteAB)});
         path[1] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenC), oracleRoute: address(mockRouteBC)});
 
-        vm.prank(owner);
-        router.setRoute(address(tokenA), address(tokenC), path);
+        _setRoute(address(tokenA), address(tokenC), path);
 
         uint256 result = router.quote(address(tokenA), address(tokenC), amountIn);
 
@@ -121,8 +146,7 @@ contract UniversalOracleRouterTest is Test {
         IUniversalOracleRouter.RouteStep[] memory path = new IUniversalOracleRouter.RouteStep[](1);
         path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(mockRouteAB)});
 
-        vm.prank(owner);
-        router.setRoute(address(tokenA), address(tokenB), path);
+        _setRoute(address(tokenA), address(tokenB), path);
 
         vm.expectRevert(LibError.InvalidPrice.selector);
         router.quote(address(tokenA), address(tokenB), 1e6);
@@ -134,8 +158,7 @@ contract UniversalOracleRouterTest is Test {
         IUniversalOracleRouter.RouteStep[] memory path = new IUniversalOracleRouter.RouteStep[](1);
         path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(mockRouteAB)});
 
-        vm.prank(owner);
-        router.setRoute(address(tokenA), address(tokenB), path);
+        _setRoute(address(tokenA), address(tokenB), path);
 
         vm.expectRevert(LibError.OracleError.selector);
         router.quote(address(tokenA), address(tokenB), 1e6);
@@ -156,10 +179,14 @@ contract UniversalOracleRouterTest is Test {
         // Intentionally setting the target token incorrectly vs expected final out mapping
         path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenC), oracleRoute: address(mockRouteAB)});
 
-        vm.prank(owner);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        // Trying to map A -> B, but path ends at C!
-        router.setRoute(address(tokenA), address(tokenB), path);
+        // Trying to map A -> B, but path ends at C. Inner revert bubbles up from `execute`.
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (address(tokenA), address(tokenB), path)),
+            owner,
+            LibError.InvalidToken.selector
+        );
     }
 
     function testRevert_SetRoute_ZeroAddressNode() public {
@@ -169,8 +196,71 @@ contract UniversalOracleRouterTest is Test {
             oracleRoute: address(0) // Malicious / Invalid Admin Check
         });
 
-        vm.prank(owner);
-        vm.expectRevert(LibError.InvalidOracleRoute.selector);
-        router.setRoute(address(tokenA), address(tokenB), path);
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (address(tokenA), address(tokenB), path)),
+            owner,
+            LibError.InvalidOracleRoute.selector
+        );
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                                   SET ROUTE TESTS                                         //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice setRoute applies the change atomically and emits RouteUpdated.
+    function test_SetRoute_AppliesAtomically() public {
+        mockRouteAB.setPrice(1e8);
+        mockRouteAB.setExpectedDecimals(8);
+
+        IUniversalOracleRouter.RouteStep[] memory path = new IUniversalOracleRouter.RouteStep[](1);
+        path[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(mockRouteAB)});
+
+        vm.expectEmit(true, true, false, false);
+        emit IUniversalOracleRouter.RouteUpdated(address(tokenA), address(tokenB), path);
+        _setRoute(address(tokenA), address(tokenB), path);
+
+        // Route is live immediately after execute
+        assertGt(router.quote(address(tokenA), address(tokenB), 1e6), 0);
+        assertEq(router.getRoute(address(tokenA), address(tokenB))[0].oracleRoute, address(mockRouteAB));
+    }
+
+    /// @notice setRoute called twice replaces the route.
+    function test_SetRoute_Replaces() public {
+        mockRouteAB.setPrice(1e8);
+        mockRouteAB.setExpectedDecimals(8);
+
+        IUniversalOracleRouter.RouteStep[] memory initialPath = new IUniversalOracleRouter.RouteStep[](1);
+        initialPath[0] = IUniversalOracleRouter.RouteStep({
+            targetToken: address(tokenB),
+            oracleRoute: address(mockRouteAB)
+        });
+
+        _setRoute(address(tokenA), address(tokenB), initialPath);
+
+        MockOracleRoute newRoute = new MockOracleRoute();
+        newRoute.setPrice(2e8);
+        newRoute.setExpectedDecimals(8);
+
+        IUniversalOracleRouter.RouteStep[] memory newPath = new IUniversalOracleRouter.RouteStep[](1);
+        newPath[0] = IUniversalOracleRouter.RouteStep({targetToken: address(tokenB), oracleRoute: address(newRoute)});
+
+        _setRoute(address(tokenA), address(tokenB), newPath);
+
+        assertEq(router.getRoute(address(tokenA), address(tokenB))[0].oracleRoute, address(newRoute));
+    }
+
+    /// @notice setRoute reverts on empty path.
+    function testRevert_SetRoute_EmptyPath() public {
+        IUniversalOracleRouter.RouteStep[] memory path = new IUniversalOracleRouter.RouteStep[](0);
+
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setRoute, (address(tokenA), address(tokenB), path)),
+            owner,
+            LibError.InvalidOracleRoute.selector
+        );
     }
 }

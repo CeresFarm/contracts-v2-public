@@ -168,9 +168,8 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         if (provider.swapType == SwapType.PARASWAP_AGGREGATOR) {
             uint256 toAmountOffset = _calculateParaswapAmountOffset(bytes4(swapData[:4]));
             _paraswapAggregatorExactOut(provider.router, fromToken, maxAmountIn, amountOut, toAmountOffset, swapData);
-        } else if (provider.swapType == SwapType.PENDLE_ROUTER) {
-            _pendleRouterSwap(provider.router, fromToken, maxAmountIn, swapData);
         } else {
+            // Pendle and Kyberswap DO NOT SUPPORT `exactOut` swaps
             revert LibError.InvalidSwapConfig();
         }
 
