@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin-contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 import {LeverageLib} from "../../src/libraries/LeverageLib.sol";
 import {RoleManager} from "../../src/periphery/RoleManager.sol";
@@ -16,6 +17,7 @@ import {ICeresSwapper} from "src/interfaces/periphery/ICeresSwapper.sol";
 
 import {MockERC20} from "test/mock/common/MockERC20.sol";
 import {MockCeresSwapper} from "test/mock/periphery/MockCeresSwapper.sol";
+import {TimelockTestHelper} from "test/common/TimelockTestHelper.sol";
 
 /// @title LeveragedStrategyBaseSetup
 /// @notice Common test infrastructure for all LeveragedStrategy implementations
@@ -39,11 +41,7 @@ abstract contract LeveragedStrategyBaseSetup is Test {
 
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
-
-    // Keys for pending updates mapping
-    bytes32 public constant ORACLE_KEY = keccak256("ORACLE");
-    bytes32 public constant SWAPPER_KEY = keccak256("SWAPPER");
-    bytes32 public constant FLASH_LOAN_ROUTER_KEY = keccak256("FLASH_LOAN_ROUTER");
+    bytes32 public constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
 
     // Default test amounts (helper functions to account for different decimals)
     function DEFAULT_DEPOSIT() internal view returns (uint256) {
@@ -91,6 +89,12 @@ abstract contract LeveragedStrategyBaseSetup is Test {
 
     // Flash loan router
     FlashLoanRouter public flashLoanRouter;
+
+    // OZ TimelockController holds TIMELOCKED_ADMIN_ROLE so all admin setter calls in tests
+    // go through the production schedule->wait->execute path.
+    TimelockController public timelock;
+    TimelockTestHelper public timelockHelper;
+    uint256 public constant TIMELOCK_MIN_DELAY = 1 days;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                    TEST ACCOUNTS                                         //
@@ -388,5 +392,37 @@ abstract contract LeveragedStrategyBaseSetup is Test {
     function _withdrawAs(address user, uint256 assets) internal returns (uint256 shares) {
         vm.prank(user);
         shares = strategy.withdraw(assets, user, user);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                                  TIMELOCK HELPERS                                         //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice Deploys the TimelockController + TimelockTestHelper, grants TIMELOCKED_ADMIN_ROLE
+    /// to the timelock, and renounces the bootstrap grant from `management` so the test models
+    /// the post-renounce production world (only the timelock can apply timelocked setters).
+    /// Child setups should call this from `_deployRoleManager` after the role manager is
+    /// constructed.
+    /// @dev `management` is used as the bootstrap admin/proposer/executor on the timelock so
+    /// test code can drive scheduling and execution. The role hand-off (grant to timelock,
+    /// renounce from management) must happen in this exact order: once management renounces,
+    /// it loses admin power over the self-administered role.
+    function _deployTimelock() internal {
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, management);
+
+        vm.startPrank(management);
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, address(timelock));
+        // Renounce the bootstrap grant pre-applied by the RoleManager constructor so management
+        // can no longer call timelocked setters directly.
+        roleManager.renounceRole(TIMELOCKED_ADMIN_ROLE, management);
+        vm.stopPrank();
+    }
+
+    /// @notice Schedule + skip(min delay) + execute a single call through the timelock,
+    /// pranking `management` as the proposer/executor. This is the canonical
+    /// path that production deployments use to update TIMELOCKED_ADMIN_ROLE setters.
+    function _runViaTimelock(address target, bytes memory data) internal {
+        timelockHelper.runViaTimelock(timelock, target, data, management);
     }
 }

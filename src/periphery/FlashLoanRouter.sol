@@ -33,6 +33,7 @@ contract FlashLoanRouter is IERC3156FlashBorrower, IFlashLoanRouter {
 
     bytes32 private constant FLASH_LOAN_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
     bytes32 private constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
+    bytes32 private constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
 
     RoleManager public immutable ROLE_MANAGER;
 
@@ -259,19 +260,22 @@ contract FlashLoanRouter is IERC3156FlashBorrower, IFlashLoanRouter {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice Configure the flash loan source for a receiver (strategy).
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`, so it goes through an external timelock
     /// @param receiver Address of the strategy allowed to call `requestFlashLoan`.
     /// @param source Flash loan provider type (Euler, Morpho, or ERC3156).
     /// @param lender Address of the lending protocol to route the flash loan through.
     /// @param enabled Whether flash loans are enabled for this receiver.
     function setFlashConfig(address receiver, FlashSource source, address lender, bool enabled) external {
-        _validateRole(MANAGEMENT_ROLE, msg.sender);
+        _validateRole(TIMELOCKED_ADMIN_ROLE, msg.sender);
         if (receiver == address(0) || lender == address(0)) revert LibError.InvalidAddress();
         flashConfig[receiver] = FlashConfig({source: source, lender: lender, enabled: enabled});
         emit FlashConfigUpdated(receiver, source, lender, enabled);
     }
 
     /// @notice Recovers any ERC20 tokens mistakenly sent to the router.
-    /// @dev Reverts if a flash loan is currently in-flight.
+    /// @dev Reverts if a flash loan is currently in-flight. Gated by `MANAGEMENT_ROLE` so it
+    /// can be invoked promptly without a timelock delay (mirrors `LeveragedStrategy._rescueTokens`).
+    /// Tokens are sent to `msg.sender` so the caller (management EOA / multisig) custodies them
     /// @param _token Address of the token to rescue.
     function rescueTokens(address _token) external {
         _validateRole(MANAGEMENT_ROLE, msg.sender);

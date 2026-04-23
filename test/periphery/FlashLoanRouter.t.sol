@@ -12,6 +12,8 @@ import {IERC3156FlashBorrower} from "@openzeppelin-contracts/interfaces/IERC3156
 import {RoleManager} from "src/periphery/RoleManager.sol";
 import {MockERC20} from "test/mock/common/MockERC20.sol";
 import {LibError} from "src/libraries/LibError.sol";
+import {TimelockTestHelper} from "test/common/TimelockTestHelper.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 /// @title FlashLoanRouterTest
 /// @notice Comprehensive test suite for FlashLoanRouter contract
@@ -33,6 +35,10 @@ contract FlashLoanRouterTest is Test {
 
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
 
+    TimelockController public timelock;
+    TimelockTestHelper public timelockHelper;
+    uint256 public constant TIMELOCK_MIN_DELAY = 1 days;
+
     event FlashConfigUpdated(
         address indexed receiver,
         FlashLoanRouter.FlashSource source,
@@ -49,6 +55,13 @@ contract FlashLoanRouterTest is Test {
 
     function setUp() public {
         roleManager = new RoleManager(0, address(this));
+        // Deploy a real TimelockController and grant it TIMELOCKED_ADMIN_ROLE so setFlashConfig/
+        // rescueTokens are exercised through the production schedule -> wait -> execute flow.
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, address(this));
+        roleManager.grantRole(keccak256("TIMELOCKED_ADMIN_ROLE"), address(timelock));
+        // Renounce the constructor-bootstrap grant so address(this) cannot bypass the timelock.
+        roleManager.renounceRole(keccak256("TIMELOCKED_ADMIN_ROLE"), address(this));
         router = new FlashLoanRouter(address(roleManager));
         token = new MockERC20("Mock Debt", "DEBT", 18);
         receiver = new MockReceiver(address(router), address(token));
@@ -56,6 +69,21 @@ contract FlashLoanRouterTest is Test {
         eulerLender = new MockEulerVault(token);
         erc3156Lender = new MockERC3156Lender(token);
         morphoLender = new MockMorphoMarket(token);
+    }
+
+    /// @dev Routes a `setFlashConfig` call through the real timelock with `address(this)` as proposer/executor.
+    function _setFlashConfig(
+        address _receiver,
+        FlashLoanRouter.FlashSource source,
+        address lender,
+        bool enabled
+    ) internal {
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(router),
+            abi.encodeCall(router.setFlashConfig, (_receiver, source, lender, enabled)),
+            address(this)
+        );
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -76,7 +104,7 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 1_000e18;
         uint256 fee = 5e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
         eulerLender.setFee(fee);
 
         // Lender needs liquidity to loan out
@@ -95,7 +123,7 @@ contract FlashLoanRouterTest is Test {
     function testEulerRouteZeroFee() public {
         uint256 amount = 1_000e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         token.mint(address(eulerLender), amount);
 
@@ -112,7 +140,7 @@ contract FlashLoanRouterTest is Test {
     function testMorphoRouteZeroFee() public {
         uint256 amount = 2_000e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
 
         token.mint(address(morphoLender), amount);
 
@@ -131,7 +159,7 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 1_500e18;
         uint256 fee = 10e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
         erc3156Lender.setFee(fee);
 
         // Lender needs liquidity to loan out
@@ -150,7 +178,7 @@ contract FlashLoanRouterTest is Test {
     function testERC3156RouteZeroFee() public {
         uint256 amount = 1_500e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
 
         token.mint(address(erc3156Lender), amount);
 
@@ -161,7 +189,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test ERC3156 validation - rejects corrupted token in callback
     function testERC3156GuardRevertsOnWrongToken() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
 
         // Lender needs liquidity
         token.mint(address(erc3156Lender), 500e18);
@@ -177,7 +205,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test flash loan request with zero amount is rejected
     function testRequestFlashLoanRevertsOnZeroAmount() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         vm.expectRevert(LibError.InvalidAmount.selector);
         receiver.initiate(address(token), 0, hex"");
@@ -185,7 +213,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test flash loan request with zero token address is rejected
     function testRequestFlashLoanRevertsOnZeroToken() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         vm.expectRevert(LibError.InvalidToken.selector);
         receiver.initiate(address(0), 1000e18, hex"");
@@ -193,7 +221,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test flash loan request when config is disabled
     function testRequestFlashLoanRevertsWhenDisabled() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), false);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), false);
 
         token.mint(address(eulerLender), 1000e18);
 
@@ -215,7 +243,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test Euler callback rejects wrong lender
     function testEulerCallbackRevertsOnWrongLender() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         MockEulerVault fakeLender = new MockEulerVault(token);
         token.mint(address(fakeLender), 1000e18);
@@ -228,7 +256,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test Morpho callback rejects wrong lender
     function testMorphoCallbackRevertsOnWrongLender() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
 
         MockMorphoMarket fakeLender = new MockMorphoMarket(token);
         token.mint(address(fakeLender), 1000e18);
@@ -241,7 +269,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test ERC3156 callback rejects wrong initiator
     function testERC3156CallbackRevertsOnWrongInitiator() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.ERC3156, address(erc3156Lender), true);
         erc3156Lender.setWrongInitiator(address(0xBEEF));
 
         token.mint(address(erc3156Lender), 1000e18);
@@ -252,7 +280,7 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test receiver revert is properly handled
     function testReceiverRevert() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         token.mint(address(eulerLender), 1000e18);
         receiver.setShouldRevert(true);
@@ -267,19 +295,14 @@ contract FlashLoanRouterTest is Test {
 
     /// @notice Test that concurrent flash loans are prevented
     function testReentrancyProtection() public {
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         MockReentrantReceiver reentrantReceiver = new MockReentrantReceiver(
             address(router),
             address(token),
             address(eulerLender)
         );
-        router.setFlashConfig(
-            address(reentrantReceiver),
-            FlashLoanRouter.FlashSource.EULER,
-            address(eulerLender),
-            true
-        );
+        _setFlashConfig(address(reentrantReceiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         token.mint(address(eulerLender), 2000e18);
 
@@ -291,26 +314,43 @@ contract FlashLoanRouterTest is Test {
     //                              ACCESS CONTROL TESTS                                         //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Test only MANAGEMENT_ROLE can set flash config
+    /// @notice Test only TIMELOCKED_ADMIN_ROLE can set flash config. Direct call from a
+    /// non-role-holder must revert without going through the timelock.
     function testSetFlashConfigRequiresManagementRole() public {
         vm.prank(unauthorizedUser);
         vm.expectRevert(LibError.Unauthorized.selector);
         router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
     }
 
-    /// @notice Test setFlashConfig reverts on zero receiver address
+    /// @notice Test setFlashConfig reverts on zero receiver address (assertion runs through the timelock).
     function testSetFlashConfigRevertsOnZeroReceiver() public {
-        vm.expectRevert(LibError.InvalidAddress.selector);
-        router.setFlashConfig(address(0), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(router),
+            abi.encodeCall(
+                router.setFlashConfig,
+                (address(0), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true)
+            ),
+            address(this),
+            LibError.InvalidAddress.selector
+        );
     }
 
-    /// @notice Test setFlashConfig reverts on zero lender address
+    /// @notice Test setFlashConfig reverts on zero lender address (assertion runs through the timelock).
     function testSetFlashConfigRevertsOnZeroLender() public {
-        vm.expectRevert(LibError.InvalidAddress.selector);
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(0), true);
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(router),
+            abi.encodeCall(
+                router.setFlashConfig,
+                (address(receiver), FlashLoanRouter.FlashSource.EULER, address(0), true)
+            ),
+            address(this),
+            LibError.InvalidAddress.selector
+        );
     }
 
-    /// @notice Test only MANAGEMENT_ROLE can rescue tokens
+    /// @notice Test only MANAGEMENT_ROLE can rescue tokens. Direct call from a non-role-holder must revert.
     function testRescueTokensRequiresManagementRole() public {
         vm.prank(unauthorizedUser);
         vm.expectRevert(LibError.Unauthorized.selector);
@@ -322,7 +362,6 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 100e18;
         token.mint(address(router), amount);
 
-        // Should succeed since no flash loan is pending
         router.rescueTokens(address(token));
 
         assertEq(token.balanceOf(address(router)), 0);
@@ -337,14 +376,14 @@ contract FlashLoanRouterTest is Test {
         vm.expectEmit(true, true, false, true);
         emit FlashConfigUpdated(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
     }
 
     /// @notice Test FlashLoanRouted event is emitted
     function testFlashLoanRoutedEvent() public {
         uint256 amount = 1_000e18;
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
         token.mint(address(eulerLender), amount);
 
         vm.expectEmit(true, true, true, true);
@@ -371,14 +410,14 @@ contract FlashLoanRouterTest is Test {
     /// @notice Test updating flash config from one source to another
     function testUpdateFlashConfig() public {
         // Initially set to Euler
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
         (FlashLoanRouter.FlashSource source, address lender, bool enabled) = router.flashConfig(address(receiver));
         assertEq(uint256(source), uint256(FlashLoanRouter.FlashSource.EULER));
         assertEq(lender, address(eulerLender));
         assertTrue(enabled);
 
         // Update to Morpho
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.MORPHO, address(morphoLender), true);
         (source, lender, enabled) = router.flashConfig(address(receiver));
         assertEq(uint256(source), uint256(FlashLoanRouter.FlashSource.MORPHO));
         assertEq(lender, address(morphoLender));
@@ -390,21 +429,21 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 1_000e18;
 
         // Enable config
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
         token.mint(address(eulerLender), amount * 2);
 
         // Should work
         receiver.initiate(address(token), amount, hex"");
 
         // Disable config
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), false);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), false);
 
         // Should fail
         vm.expectRevert(LibError.InvalidAction.selector);
         receiver.initiate(address(token), amount, hex"");
 
         // Re-enable
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
 
         // Should work again
         receiver.initiate(address(token), amount, hex"");
@@ -415,6 +454,8 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 100e18;
         token.mint(address(router), amount);
 
+        // rescueTokens is MANAGEMENT_ROLE-gated (no timelock) and sends to msg.sender, so the
+        // admin EOA receives the rescued tokens directly.
         uint256 adminBalanceBefore = token.balanceOf(admin);
 
         router.rescueTokens(address(token));
@@ -428,7 +469,7 @@ contract FlashLoanRouterTest is Test {
         uint256 amount = 1_000e18;
         bytes memory customData = abi.encode("custom", uint256(42), address(0xABCD));
 
-        router.setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
+        _setFlashConfig(address(receiver), FlashLoanRouter.FlashSource.EULER, address(eulerLender), true);
         token.mint(address(eulerLender), amount);
 
         receiver.initiate(address(token), amount, customData);

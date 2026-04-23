@@ -161,18 +161,16 @@ contract SiloTestSetup is LeveragedStrategyBaseSetup {
         router = new UniversalOracleRouter(address(roleManager));
         SiloOracleRoute siloRoute = new SiloOracleRoute(address(siloOracle), address(savUSD), address(usdc));
 
-        vm.startPrank(management);
         IUniversalOracleRouter.RouteStep[] memory collToDebt = new IUniversalOracleRouter.RouteStep[](1);
         collToDebt[0] = IUniversalOracleRouter.RouteStep({targetToken: address(usdc), oracleRoute: address(siloRoute)});
-        router.setRoute(address(savUSD), address(usdc), collToDebt);
+        _runViaTimelock(address(router), abi.encodeCall(router.setRoute, (address(savUSD), address(usdc), collToDebt)));
 
         IUniversalOracleRouter.RouteStep[] memory debtToColl = new IUniversalOracleRouter.RouteStep[](1);
         debtToColl[0] = IUniversalOracleRouter.RouteStep({
             targetToken: address(savUSD),
             oracleRoute: address(siloRoute)
         });
-        router.setRoute(address(usdc), address(savUSD), debtToColl);
-        vm.stopPrank();
+        _runViaTimelock(address(router), abi.encodeCall(router.setRoute, (address(usdc), address(savUSD), debtToColl)));
 
         siloOracleAdapter = new OracleAdapter(
             address(router),
@@ -203,6 +201,9 @@ contract SiloTestSetup is LeveragedStrategyBaseSetup {
         roleManager.grantRole(MANAGEMENT_ROLE, management);
         roleManager.grantRole(KEEPER_ROLE, keeper);
         vm.stopPrank();
+
+        // Deploy timelock and grant TIMELOCKED_ADMIN_ROLE to it
+        _deployTimelock();
     }
 
     function _deployStrategy() internal override {
@@ -235,24 +236,29 @@ contract SiloTestSetup is LeveragedStrategyBaseSetup {
     }
 
     function _initializeStrategy() internal override {
+        // Timelocked setters: route through real TimelockController.
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setSwapper, (address(swapper))));
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setOracleAdapter, (address(siloOracleAdapter))));
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setFlashLoanRouter, (address(flashLoanRouter))));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver))
+        );
+
         vm.startPrank(management);
-
-        // Set swapper and oracle adapter (executes immediately since current values are address(0))
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, SWAPPER_KEY, address(swapper));
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(siloOracleAdapter));
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, FLASH_LOAN_ROUTER_KEY, address(flashLoanRouter));
-
-        // Set LTV parameters + fee recipient
-        strategy.updateConfig(MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver);
         strategy.setTargetLtv(TARGET_LTV_BPS, LTV_BUFFER_BPS);
         strategy.setDepositWithdrawLimits(DEPOSIT_LIMIT, REDEEM_LIMIT_SHARES, 0);
-
         vm.stopPrank();
     }
 
     function _configureFlashLoanRouter() internal override {
-        vm.prank(management);
-        flashLoanRouter.setFlashConfig(address(strategy), FlashLoanRouter.FlashSource.ERC3156, address(usdcSilo), true);
+        _runViaTimelock(
+            address(flashLoanRouter),
+            abi.encodeCall(
+                flashLoanRouter.setFlashConfig,
+                (address(strategy), FlashLoanRouter.FlashSource.ERC3156, address(usdcSilo), true)
+            )
+        );
     }
 
     function _addProtocolLiquidity() internal override {

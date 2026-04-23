@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
-import {SafeCast} from "@openzeppelin-contracts/utils/math/SafeCast.sol";
 import {Math} from "@openzeppelin-contracts/utils/math/Math.sol";
 
 import {CeresBaseVault} from "./CeresBaseVault.sol";
@@ -17,19 +16,12 @@ import {ICeresSwapper} from "../interfaces/periphery/ICeresSwapper.sol";
 
 abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     using SafeERC20 for IERC20;
-    using SafeCast for uint256;
     using Math for uint256;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                 CONSTANTS/IMMUTABLES                                      //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    uint256 internal constant DELAY = 2 days;
-
-    // Keys for pending updates mapping
-    bytes32 internal constant ORACLE_KEY = keccak256("ORACLE");
-    bytes32 internal constant SWAPPER_KEY = keccak256("SWAPPER");
-    bytes32 internal constant FLASH_LOAN_ROUTER_KEY = keccak256("FLASH_LOAN_ROUTER");
     bytes32 private constant FLASH_LOAN_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -39,27 +31,40 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     /// @custom:storage-location erc7201:ceres.storage.LeveragedStrategy
     // prettier-ignore
     struct LeveragedStrategyStorage {
-        mapping(bytes32 key => PendingUpdate) pendingUpdatesByKey;
-
+        // Slot 0: 160 + 8 + 16 + 16 = 200 bits (56 bits free)
+        // Co-read in swapAndDepositCollateral, _freeFunds, getNetAssets, _deployFunds
         IERC20 collateralToken;
-        IERC20 debtToken;
-
         bool isAssetCollateral;
+        uint16 targetLtvBps;
+        uint16 ltvBufferBps;
 
-        // Flag to indicate if exactOut swap is available in the swapper for collateral-> debt route
+        // Slot 1: 160 + 48 + 48 = 256 bits
+        // debtToken co-read with keeper delay fields: _enforceKeeperDelay warms this slot,
+        // then debtToken is warm (100 gas) for rebalance, onFlashLoanReceived, _leverageUp/Down, _freeFunds
+        IERC20 debtToken;
+        uint48 keeperDelay;
+        uint48 lastKeeperAction;
+
+        // Slot 2: 160 bits (96 bits free)
+        IOracleAdapter oracleAdapter;
+
+        // Slot 3: 160 + 8 = 168 bits (88 bits free)
+        // Co-read in every _executeSwap call
+        ICeresSwapper swapper;
         bool isExactOutSwapEnabled;
 
-        uint16 targetLtvBps;
-        IOracleAdapter oracleAdapter;
-        ICeresSwapper swapper;
+        // Slot 4: 160 bits (96 bits free)
         IFlashLoanRouter flashLoanRouter;
-
-        uint16 ltvBufferBps;
     }
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.LeveragedStrategy")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant LEVERAGED_STRATEGY_STORAGE_LOCATION =
         0xdf5835635f9c63f5038c3c39a3e8c20793eb241995cc033746644d7d39feeb00;
+
+    /// @dev Set to true immediately before this contract initiates a flash loan and cleared
+    /// inside `onFlashLoanReceived`. Prevents a malicious flash-loan router from
+    /// invoking the callback without a corresponding strategy-initiated flash loan.
+    bool private transient _pendingFlashLoanAction;
 
     function _getLeveragedStrategyStorage() private pure returns (LeveragedStrategyStorage storage S) {
         assembly {
@@ -132,6 +137,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         uint256 assetAmount,
         bytes calldata swapData
     ) external nonReentrant onlyRole(KEEPER_ROLE) {
+        _enforceKeeperDelay();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
 
         // Revert if the asset and collateral is the same
@@ -170,11 +176,13 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         bool useFlashLoan,
         bytes calldata swapData
     ) external nonReentrant onlyRole(KEEPER_ROLE) {
+        _enforceKeeperDelay();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
 
         if (useFlashLoan) {
             if (address(S.flashLoanRouter) == address(0)) revert LibError.InvalidAddress();
             bytes memory userData = abi.encode(isLeverageUp, swapData);
+            _pendingFlashLoanAction = true;
             S.flashLoanRouter.requestFlashLoan(address(S.debtToken), amount, userData);
             // Flash loan callback continues the rebalance process in `onFlashLoanReceived`
         } else {
@@ -211,6 +219,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         uint256 fee,
         bytes calldata data
     ) external returns (bytes32) {
+        if (!_pendingFlashLoanAction) revert LibError.UnexpectedCallback();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
         if (msg.sender != address(S.flashLoanRouter)) revert LibError.InvalidAddress();
         if (token != address(S.debtToken)) revert LibError.InvalidToken();
@@ -234,6 +243,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
 
         // Approve FlashLoan Router to pull repayment and pass it back to the underlying lender
         S.debtToken.forceApprove(address(S.flashLoanRouter), repayAmount);
+        _pendingFlashLoanAction = false;
         return FLASH_LOAN_SUCCESS;
     }
 
@@ -347,16 +357,6 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         return _getLeveragedStrategyStorage().debtToken;
     }
 
-    /// @notice Returns the pending update details for a given key (oracle, swapper, or flash loan router).
-    /// @param key One of the ORACLE_KEY, SWAPPER_KEY, or FLASH_LOAN_ROUTER_KEY constants.
-    /// @return implementation The proposed new address.
-    /// @return readyTimestamp The timestamp after which the update can be executed.
-    function pendingUpdates(bytes32 key) external view returns (address implementation, uint64 readyTimestamp) {
-        PendingUpdate memory pending = _getLeveragedStrategyStorage().pendingUpdatesByKey[key];
-        implementation = pending.implementation;
-        readyTimestamp = pending.readyTimestamp;
-    }
-
     /// @notice Returns the full leveraged strategy configuration.
     /// @return isExactOutSwapEnabled True if exact-output swaps are allowed.
     /// @return targetLtvBps The target loan-to-value ratio.
@@ -391,6 +391,12 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         return _getLeveragedStrategyStorage().oracleAdapter;
     }
 
+    /// @notice Returns the current keeper delay in seconds.
+    /// @return The keeper delay duration.
+    function keeperDelay() external view returns (uint48) {
+        return _getLeveragedStrategyStorage().keeperDelay;
+    }
+
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                ADMIN FUNCTIONS: SETTERS                                   //
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -419,48 +425,48 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         emit TargetLtvUpdated(_ltvBps, _ltvBufferBps);
     }
 
-    /// @notice Unified 2-step update management for oracle, swapper, and flash loan router.
-    /// @dev For existing addresses, a 2-day timelock applies before the update can be executed.
-    /// If no address is currently set, the update is applied immediately.
-    /// @param action Request, Execute, or Cancel the pending update.
-    /// @param key One of ORACLE_KEY, SWAPPER_KEY, or FLASH_LOAN_ROUTER_KEY.
-    /// @param newAddress The proposed replacement address.
-    function manageUpdate(UpdateAction action, bytes32 key, address newAddress) external onlyRole(MANAGEMENT_ROLE) {
+    /// @notice Sets a new oracle adapter.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE` so the call must originate from
+    /// `TimelockController`, applying the configured min-delay to this action.
+    /// @param _oracleAdapter The replacement oracle adapter address. Must be non-zero.
+    function setOracleAdapter(address _oracleAdapter) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        if (_oracleAdapter == address(0)) revert LibError.InvalidAddress();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        address oldAddress = address(S.oracleAdapter);
+        S.oracleAdapter = IOracleAdapter(_oracleAdapter);
+        emit OracleAdapterUpdated(oldAddress, _oracleAdapter);
+    }
 
-        if (action == UpdateAction.Request) {
-            // Request
-            if (newAddress == address(0)) revert LibError.InvalidAddress();
-            if (S.pendingUpdatesByKey[key].implementation != address(0)) revert LibError.PendingActionExists();
+    /// @notice Sets a new swapper.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE` to enforce a delay
+    /// @param _swapper The replacement swapper address. Must be non-zero.
+    function setSwapper(address _swapper) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        if (_swapper == address(0)) revert LibError.InvalidAddress();
+        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        address oldAddress = address(S.swapper);
+        S.swapper = ICeresSwapper(_swapper);
+        emit SwapperUpdated(oldAddress, _swapper);
+    }
 
-            address currentAddress = _getCurrentAddress(key);
+    /// @notice Sets a new flash loan router.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE` to enforce a delay.
+    /// @param _flashLoanRouter The replacement flash loan router address. Must be non-zero.
+    function setFlashLoanRouter(address _flashLoanRouter) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        if (_flashLoanRouter == address(0)) revert LibError.InvalidAddress();
+        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        address oldAddress = address(S.flashLoanRouter);
+        S.flashLoanRouter = IFlashLoanRouter(_flashLoanRouter);
+        emit FlashLoanRouterUpdated(oldAddress, _flashLoanRouter);
+    }
 
-            // If current implementation is not set, allow immediate update
-            if (currentAddress == address(0)) {
-                _setImplementation(key, newAddress);
-                emit UpdateExecuted(key, address(0), newAddress);
-            } else {
-                uint64 readyAt = (block.timestamp + DELAY).toUint64();
-                S.pendingUpdatesByKey[key] = PendingUpdate(newAddress, readyAt);
-                emit UpdateRequested(key, newAddress, readyAt);
-            }
-        } else if (action == UpdateAction.Execute) {
-            // Execute
-            PendingUpdate memory pending = S.pendingUpdatesByKey[key];
-            if (pending.implementation == address(0)) revert LibError.NoPendingActionExists();
-            if (block.timestamp < pending.readyTimestamp) revert LibError.NotReady();
-
-            address oldAddress = _getCurrentAddress(key);
-            _setImplementation(key, pending.implementation);
-            delete S.pendingUpdatesByKey[key];
-            emit UpdateExecuted(key, oldAddress, pending.implementation);
-        } else if (action == UpdateAction.Cancel) {
-            // Cancel
-            address proposed = S.pendingUpdatesByKey[key].implementation;
-            if (proposed == address(0)) revert LibError.NoPendingActionExists();
-            delete S.pendingUpdatesByKey[key];
-            emit UpdateCancelled(key, proposed);
-        }
+    /// @notice Sets the delay between consecutive keeper actions.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`. See {setOracleAdapter} for delay rationale.
+    /// @param _keeperDelay New delay in seconds applied to keeper-only entry points.
+    function setKeeperDelay(uint48 _keeperDelay) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        uint48 oldDelay = S.keeperDelay;
+        S.keeperDelay = _keeperDelay;
+        emit KeeperDelayUpdated(oldDelay, _keeperDelay);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -542,6 +548,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     function _onProcessRequest(bytes calldata /* extraData */) internal virtual override {
+        _enforceKeeperDelay();
         _harvestAndReport();
     }
 
@@ -627,6 +634,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         if (flashLoanAmount > 0 && _getDebtAmount() > 0) {
             // FL callback handles only debt repayment. Any unused collateral from the
             // exactOut swap inside the FL is refunded to the strategy by the swapper.
+            _pendingFlashLoanAction = true;
             S.flashLoanRouter.requestFlashLoan(
                 address(S.debtToken),
                 flashLoanAmount,
@@ -707,12 +715,23 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     //                             INTERNAL HELPER FUNCTIONS                                     //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
+    /// @dev Reverts if the keeper delay has not elapsed since the last keeper action.
+    /// Updates the last action timestamp on success.
+    function _enforceKeeperDelay() internal {
+        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        uint48 delay = S.keeperDelay;
+        if (delay > 0) {
+            if (block.timestamp < uint256(S.lastKeeperAction) + delay) revert LibError.KeeperDelayNotElapsed();
+        }
+        S.lastKeeperAction = uint48(block.timestamp);
+    }
+
     /// @dev Reverts if current LTV plus the buffer exceeds the market's max LTV.
     function _validateStrategyLtv() internal view {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
 
         // Validate that strategy LTV is within limits after applying buffer
-        if (_getStrategyLtv() + S.ltvBufferBps > _getStrategyMaxLtvBps()) revert LibError.AboveMaxLtv();
+        if (_getStrategyLtv() + S.ltvBufferBps >= _getStrategyMaxLtvBps()) revert LibError.AboveMaxLtv();
     }
 
     /// @dev Swaps `debtAmount` of debt token into collateral, deposits it, then borrows `debtAmount`.
@@ -763,33 +782,6 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         if (toWithdraw > 0) {
             _withdrawCollateral(toWithdraw);
             _executeSwap(S.collateralToken, S.debtToken, toWithdraw, debtAmount, true, swapData);
-        }
-    }
-
-    /// @dev Returns the current address for a given configuration key.
-    /// @param key The configuration key.
-    /// @return The current implementation address.
-    function _getCurrentAddress(bytes32 key) internal view returns (address) {
-        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        if (key == ORACLE_KEY) return address(S.oracleAdapter);
-        if (key == SWAPPER_KEY) return address(S.swapper);
-        if (key == FLASH_LOAN_ROUTER_KEY) return address(S.flashLoanRouter);
-        revert LibError.InvalidKey();
-    }
-
-    /// @dev Updates the storage slot for a given configuration key to `newAddress`.
-    /// @param key The configuration key.
-    /// @param newAddress The new address to set.
-    function _setImplementation(bytes32 key, address newAddress) internal {
-        LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        if (key == ORACLE_KEY) {
-            S.oracleAdapter = IOracleAdapter(newAddress);
-        } else if (key == SWAPPER_KEY) {
-            S.swapper = ICeresSwapper(newAddress);
-        } else if (key == FLASH_LOAN_ROUTER_KEY) {
-            S.flashLoanRouter = IFlashLoanRouter(newAddress);
-        } else {
-            revert LibError.InvalidKey();
         }
     }
 

@@ -3,17 +3,18 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
+import {TimelockController} from "@openzeppelin-contracts/governance/TimelockController.sol";
 
 import {CeresBaseVault} from "src/strategies/CeresBaseVault.sol";
 import {LeveragedStrategy} from "src/strategies/LeveragedStrategy.sol";
 import {RoleManager} from "src/periphery/RoleManager.sol";
-import {ILeveragedStrategy} from "src/interfaces/strategies/ILeveragedStrategy.sol";
 
 import {MockERC20} from "test/mock/common/MockERC20.sol";
 import {MockCeresSwapper} from "test/mock/periphery/MockCeresSwapper.sol";
 import {MockLeveragedStrategy} from "../mock/common/MockLeveragedStrategy.sol";
 import {MinimalOracleAdapter} from "../mock/common/MinimalOracleAdapter.sol";
 import {LeveragedStrategyHandler} from "./handlers/LeveragedStrategyHandler.sol";
+import {TimelockTestHelper} from "../common/TimelockTestHelper.sol";
 
 /// @title LeveragedStrategyInvariant
 /// @notice Invariant test suite for LeveragedStrategy vault and leverage logic.
@@ -23,12 +24,9 @@ contract LeveragedStrategyInvariant is Test {
     //                                 CONSTANTS/IMMUTABLES                                      //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    bytes32 internal constant ORACLE_KEY = keccak256("ORACLE");
-    bytes32 internal constant SWAPPER_KEY = keccak256("SWAPPER");
-    bytes32 internal constant FLASH_LOAN_ROUTER_KEY = keccak256("FLASH_LOAN_ROUTER");
     bytes32 internal constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
     bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
-    uint256 internal constant DELAY = 2 days;
+    bytes32 internal constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                         STATE                                             //
@@ -46,6 +44,10 @@ contract LeveragedStrategyInvariant is Test {
     RoleManager internal roleManager;
     MockLeveragedStrategy internal strategy;
     LeveragedStrategyHandler internal handler;
+
+    TimelockController internal timelock;
+    TimelockTestHelper internal timelockHelper;
+    uint256 internal constant TIMELOCK_MIN_DELAY = 1 days;
 
     function setUp() public {
         management = makeAddr("management");
@@ -74,7 +76,15 @@ contract LeveragedStrategyInvariant is Test {
         vm.startPrank(management);
         roleManager.grantRole(MANAGEMENT_ROLE, management);
         roleManager.grantRole(KEEPER_ROLE, keeper);
+        // Handler.setConfigKey() calls strategy.setOracleAdapter/setSwapper directly during fuzz,
+        // so management retains TIMELOCKED_ADMIN_ROLE for the fuzz path
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, management);
         vm.stopPrank();
+
+        timelockHelper = new TimelockTestHelper();
+        timelock = timelockHelper.deployTimelock(TIMELOCK_MIN_DELAY, management);
+        vm.prank(management);
+        roleManager.grantRole(TIMELOCKED_ADMIN_ROLE, address(timelock));
 
         // Strategy
         vm.startPrank(management);
@@ -90,24 +100,39 @@ contract LeveragedStrategyInvariant is Test {
         vm.stopPrank();
 
         // Strategy configuration
+        // Oracle/swapper/config setters are TIMELOCKED_ADMIN_ROLE-gated -> route via timelock.
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setOracleAdapter, (address(oracle))),
+            management
+        );
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setSwapper, (address(swapper))),
+            management
+        );
+
         vm.startPrank(management);
-
-        // Oracle and swapper are currently address(0) -> manageUpdate (request) executes immediately.
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(oracle));
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, SWAPPER_KEY, address(swapper));
-
         strategy.setDepositWithdrawLimits(
             100_000_000e18, // depositLimit
             type(uint128).max, // redeemLimitShares: unlimited
             0 // minDepositAmount
         );
+        vm.stopPrank();
 
         // 0.25% max slippage, 15% performance fee, 2% max loss + fee recipient.
-        strategy.updateConfig(25, 1500, 200, feeRecipient);
+        timelockHelper.runViaTimelock(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient)),
+            management
+        );
 
+        vm.startPrank(management);
         // Target LTV: 70%, buffer: 0.5%. Max LTV is 90%, so 70 + 0.5 = 70.5 < 90.
         strategy.setTargetLtv(7000, 50);
-
         vm.stopPrank();
 
         // Handler
@@ -381,33 +406,6 @@ contract LeveragedStrategyInvariant is Test {
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
-    //  Invariant: LS-INV-6
-    //  For any pending config update: readyTimestamp >= ghost_requestedAt + DELAY.
-    //
-    //  requestUpdate() records readyTimestamp = block.timestamp + DELAY on-chain.
-    //  The handler ghost records block.timestamp at the moment of the request.
-    //
-    //  Note: a bug or an off-by-one in the contract could make
-    //  readyTimestamp < requestedAt + DELAY, allowing immediate execution of a
-    //  configuration update that was supposed to be time-locked.
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-    function invariant_LS6_timelockSemantics() public view {
-        bytes32[3] memory keys = [ORACLE_KEY, SWAPPER_KEY, FLASH_LOAN_ROUTER_KEY];
-
-        for (uint256 i = 0; i < 3; i++) {
-            (, uint64 readyTimestamp) = strategy.pendingUpdates(keys[i]);
-            if (readyTimestamp == 0) continue; // no pending update for this key
-
-            uint64 requestedAt = handler.ghost_requestedAt(i);
-            assertGe(
-                uint256(readyTimestamp),
-                uint256(requestedAt) + DELAY,
-                "LS-INV-6: readyTimestamp < requestedAt + DELAY (timelock bypass)"
-            );
-        }
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////
     //  afterInvariant: log call distribution for coverage analysis
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -423,8 +421,6 @@ contract LeveragedStrategyInvariant is Test {
         emit log_named_uint("calls: leverageUp            ", handler.calls_leverageUp());
         emit log_named_uint("calls: leverageDown          ", handler.calls_leverageDown());
         emit log_named_uint("calls: setTargetLtv          ", handler.calls_setTargetLtv());
-        emit log_named_uint("calls: requestConfigUpdate   ", handler.calls_requestConfigUpdate());
-        emit log_named_uint("calls: executeConfigUpdate   ", handler.calls_executeConfigUpdate());
-        emit log_named_uint("calls: cancelConfigUpdate    ", handler.calls_cancelConfigUpdate());
+        emit log_named_uint("calls: setConfigKey          ", handler.calls_setConfig());
     }
 }

@@ -43,6 +43,7 @@ abstract contract CeresBaseVault is
 
     bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 internal constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
+    bytes32 internal constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.CeresBaseVault")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant CERES_BASE_VAULT_STORAGE_LOCATION =
@@ -547,6 +548,7 @@ abstract contract CeresBaseVault is
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice Updates vault fee and slippage configuration.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`, can only be updated after a delay
     /// @param _maxSlippageBps Maximum allowed swap slippage in basis points.
     /// @param _performanceFeeBps Performance fee rate in basis points.
     /// @param _maxLossBps Maximum tolerated loss when processing a redeem batch, in basis points.
@@ -556,7 +558,7 @@ abstract contract CeresBaseVault is
         uint16 _performanceFeeBps,
         uint16 _maxLossBps,
         address _performanceFeeRecipient
-    ) external virtual onlyRole(MANAGEMENT_ROLE) {
+    ) external virtual onlyRole(TIMELOCKED_ADMIN_ROLE) {
         if (_maxSlippageBps > MAX_FEE || _performanceFeeBps > MAX_FEE || _maxLossBps > MAX_FEE) {
             revert LibError.InvalidValue();
         }

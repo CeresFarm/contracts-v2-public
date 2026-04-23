@@ -481,11 +481,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         assertGt(assetsReceived, 0, "Should receive assets");
         assertApproxEqRel(assetsReceived, depositAmount / 2, 1e15, "Should receive ~half of deposit");
 
-        assertEq(
-            strategy.balanceOf(address(strategy)),
-            0,
-            "Strategy should have 0 shares after processing and claim"
-        );
+        assertEq(strategy.balanceOf(address(strategy)), 0, "Strategy should have 0 shares after processing and claim");
 
         // Verify withdrawal reserve decreased
         assertLt(strategy.withdrawalReserve(), reserveBefore, "Withdrawal reserve should decrease");
@@ -1030,8 +1026,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         assertFalse(isExactOutSwapEnabled, "exactOut should be disabled");
 
         // Set higher slippage on swapper to simulate insufficient debt tokens after swap
-        vm.prank(management);
-        strategy.updateConfig(300, 1500, MAX_LOSS_BPS, address(0));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (300, 1500, MAX_LOSS_BPS, address(0)))
+        );
 
         swapper.setSlippage(310); // 3.1% slippage - will return less than expected
 
@@ -1299,8 +1297,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
 
         // Set low slippage tolerance
         (, uint16 performanceFeeBps, uint16 maxLossBps, , , ) = strategy.getConfig();
-        vm.prank(management);
-        strategy.updateConfig(10, performanceFeeBps, maxLossBps, address(0)); // 0.1%
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (10, performanceFeeBps, maxLossBps, address(0))) // 0.1%
+        );
 
         // Set high swapper slippage
         swapper.setSlippage(100); // 1%
@@ -1339,10 +1339,12 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     function test_SetMaxSlippage_Success() public {
         uint16 newSlippage = 100; // 1%
 
-        vm.prank(management);
         vm.expectEmit(true, true, true, true);
         emit ICeresBaseVault.ConfigUpdated();
-        strategy.updateConfig(newSlippage, 1500, MAX_LOSS_BPS, address(0));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (newSlippage, 1500, MAX_LOSS_BPS, address(0)))
+        );
 
         (uint16 maxSlippageBps, , , , , ) = strategy.getConfig();
         assertEq(maxSlippageBps, newSlippage, "Max slippage should be updated");
@@ -1362,56 +1364,33 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
-    //                          ORACLE/SWAPPER UPDATE TESTS (2-step)                             //
+    //                          ORACLE/SWAPPER UPDATE TESTS (TIMELOCKED_ADMIN_ROLE)              //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @dev Shared helper: requests an update for `key`, asserts the pending state is set,
-    ///      warps past the delay and executes — does NOT assert the final contract state,
-    ///      which is protocol-specific and asserted by each caller.
-    function _executeTwoStepUpdate(bytes32 key, address newImpl) internal {
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, key, newImpl);
-
-        (address pendingImpl, uint64 readyTime) = strategy.pendingUpdates(key);
-        assertEq(pendingImpl, newImpl, "pending impl mismatch");
-        assertEq(readyTime, block.timestamp + 2 days, "readyTime mismatch");
-
-        vm.warp(block.timestamp + 2 days);
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Execute, key, address(0));
-    }
-
-    function test_SetOracleAdapter_TwoStepProcess() public {
-        address oldAdapter = address(strategy.oracleAdapter());
+    function test_SetOracleAdapter_Success() public {
         address newAdapter = address(0x123);
-
-        assertEq(address(strategy.oracleAdapter()), oldAdapter, "should not update before delay");
-        _executeTwoStepUpdate(ORACLE_KEY, newAdapter);
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setOracleAdapter, (newAdapter)));
         assertEq(address(strategy.oracleAdapter()), newAdapter, "oracle adapter should be updated");
     }
 
-    function test_SetSwapper_TwoStepProcess() public {
+    function test_SetSwapper_Success() public {
         address newSwapper = address(0x456);
-
-        _executeTwoStepUpdate(SWAPPER_KEY, newSwapper);
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setSwapper, (newSwapper)));
         (, , , , address updatedSwapper, ) = strategy.getLeveragedStrategyConfig();
         assertEq(updatedSwapper, newSwapper, "swapper should be updated");
     }
 
-    function test_CancelUpdate_Success() public {
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(0x123));
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, ORACLE_KEY, address(0));
-        (address pendingOracle, ) = strategy.pendingUpdates(ORACLE_KEY);
-        assertEq(pendingOracle, address(0), "oracle pending should be cleared");
+    function test_SetFlashLoanRouter_Success() public {
+        address newRouter = address(0x789);
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setFlashLoanRouter, (newRouter)));
+        (, , , , , address updatedRouter) = strategy.getLeveragedStrategyConfig();
+        assertEq(updatedRouter, newRouter, "flash loan router should be updated");
+    }
 
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, SWAPPER_KEY, address(0x456));
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, SWAPPER_KEY, address(0));
-        (address pendingSwapper, ) = strategy.pendingUpdates(SWAPPER_KEY);
-        assertEq(pendingSwapper, address(0), "swapper pending should be cleared");
+    function test_SetKeeperDelay_Success() public {
+        uint48 newDelay = 1 hours;
+        _runViaTimelock(address(strategy), abi.encodeCall(strategy.setKeeperDelay, (newDelay)));
+        assertEq(strategy.keeperDelay(), newDelay, "keeper delay should be updated");
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -1425,10 +1404,15 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         vm.expectRevert(LibError.Unauthorized.selector);
         strategy.setTargetLtv(6000, LTV_BUFFER_BPS);
 
-        // Management-only: manageUpdate (request)
+        // TIMELOCKED_ADMIN_ROLE-only: setOracleAdapter. Direct call (even from management) reverts
+        // because only the timelock holds the role.
+        vm.prank(management);
+        vm.expectRevert(LibError.Unauthorized.selector);
+        strategy.setOracleAdapter(address(0x123));
+
         vm.prank(user1);
         vm.expectRevert(LibError.Unauthorized.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(0x123));
+        strategy.setOracleAdapter(address(0x123));
 
         // Keeper-only: rebalance
         _setupUserDeposit(user1, DEFAULT_DEPOSIT());
@@ -1451,50 +1435,44 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     }
 
     function testRevert_SetMaxSlippage_InvalidValue() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidValue.selector);
-        strategy.updateConfig(10001, 1500, MAX_LOSS_BPS, address(0)); // > 100%
+        // updateConfig is timelocke,  the InvalidValue revert must bubble up from execute().
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (10001, 1500, MAX_LOSS_BPS, address(0))), // > 100%
+            management,
+            LibError.InvalidValue.selector
+        );
     }
 
-    function testRevert_RequestUpdate_ZeroAddress() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidAddress.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(0));
+    function testRevert_SetOracleAdapter_ZeroAddress() public {
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setOracleAdapter, (address(0))),
+            management,
+            LibError.InvalidAddress.selector
+        );
     }
 
-    function testRevert_Invalid_Validations() public {
-        // Cannot execute before delay has passed
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(0x123));
-        vm.prank(management);
-        vm.expectRevert(LibError.NotReady.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Execute, ORACLE_KEY, address(0));
+    function testRevert_SetSwapper_ZeroAddress() public {
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setSwapper, (address(0))),
+            management,
+            LibError.InvalidAddress.selector
+        );
+    }
 
-        // Cannot request a second update while one is pending
-        vm.prank(management);
-        vm.expectRevert(LibError.PendingActionExists.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Request, ORACLE_KEY, address(0x789));
-
-        // Reset state
-        vm.prank(management);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, ORACLE_KEY, address(0));
-
-        // Cannot execute or cancel when nothing is pending
-        vm.prank(management);
-        vm.expectRevert(LibError.NoPendingActionExists.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Execute, ORACLE_KEY, address(0));
-
-        vm.prank(management);
-        vm.expectRevert(LibError.NoPendingActionExists.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Execute, SWAPPER_KEY, address(0));
-
-        vm.prank(management);
-        vm.expectRevert(LibError.NoPendingActionExists.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, ORACLE_KEY, address(0));
-
-        vm.prank(management);
-        vm.expectRevert(LibError.NoPendingActionExists.selector);
-        strategy.manageUpdate(ILeveragedStrategy.UpdateAction.Cancel, SWAPPER_KEY, address(0));
+    function testRevert_SetFlashLoanRouter_ZeroAddress() public {
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.setFlashLoanRouter, (address(0))),
+            management,
+            LibError.InvalidAddress.selector
+        );
     }
 
     function testRevert_RescueTokens_StrategyTokens() public {
@@ -1609,8 +1587,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         // Set performance fee to 10%
         (uint16 maxSlippageBps, , uint16 maxLossBps, , , ) = strategy.getConfig();
 
-        vm.prank(management);
-        strategy.updateConfig(maxSlippageBps, 10_00, maxLossBps, address(0));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, 10_00, maxLossBps, address(0)))
+        );
 
         // Deposit into strategy
         _setupUserDeposit(user1, _amount);
