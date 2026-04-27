@@ -184,4 +184,13 @@ contract LeveragedEuler is LeveragedStrategy {
     function _getStrategyMaxLtvBps() internal view override returns (uint16 maxLtvBps) {
         maxLtvBps = _getMaxLtv().toUint16();
     }
+
+    /// @dev Rejects rescue of Euler vault share tokens (collateralVault / borrowVault). Both are
+    /// ERC4626-style transferable shares that represent the strategy's deposit and borrow positions
+    function _validateRescueToken(address _token) internal view override {
+        LeveragedEulerStorage storage S = _getLeveragedEulerStorage();
+        if (_token == address(S.collateralVault) || _token == address(S.borrowVault)) {
+            revert LibError.InvalidToken();
+        }
+    }
 }

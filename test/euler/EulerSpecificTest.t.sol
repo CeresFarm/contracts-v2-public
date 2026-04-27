@@ -95,4 +95,22 @@ contract EulerSpecificTest is EulerTestSetup {
         // Net assets should have increased due to collateral yield
         assertTrue(finalNetAssets > initialNetAssets, "Net assets should increase with collateral yield");
     }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                              RESCUE RECEIPT-TOKEN PROTECTION                              //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice Rescue must not be able to transfer the Euler collateral vault shares.
+    function testRevert_RescueTokens_CollateralVaultShares() public {
+        vm.prank(management);
+        vm.expectRevert(LibError.InvalidToken.selector);
+        strategy.executeOperation(4, 0, address(collateralVault));
+    }
+
+    /// @notice Rescue must not be able to transfer the Euler borrow vault shares.
+    function testRevert_RescueTokens_BorrowVaultShares() public {
+        vm.prank(management);
+        vm.expectRevert(LibError.InvalidToken.selector);
+        strategy.executeOperation(4, 0, address(borrowVault));
+    }
 }

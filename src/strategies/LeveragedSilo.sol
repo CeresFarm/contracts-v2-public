@@ -223,4 +223,14 @@ contract LeveragedSilo is LeveragedStrategy {
         uint256 maxLtv = _getMaxLtv();
         maxLtvBps = maxLtv.mulDiv(BPS_PRECISION, 1e18, Math.Rounding.Floor).toUint16();
     }
+
+    /// @dev Rejects rescue of Silo share tokens (the silo contracts are themselves the share
+    /// tokens). Both are ERC4626-style transferable shares that represent the strategy's deposit
+    /// and borrow positions
+    function _validateRescueToken(address _token) internal view override {
+        LeveragedSiloStorage storage S = _getLeveragedSiloStorage();
+        if (_token == address(S.depositSilo) || _token == address(S.borrowSilo)) {
+            revert LibError.InvalidToken();
+        }
+    }
 }

@@ -114,6 +114,9 @@ contract LeveragedAave is LeveragedStrategy {
         LeveragedAaveStorage storage S = _getLeveragedAaveStorage();
         S.aavePool.setUserEMode(categoryId);
 
+        // Reject category changes that immediately push the strategy above the buffer-adjusted LTV
+        _validateStrategyLtv();
+
         emit StrategyEModeUpdated(categoryId);
     }
 
@@ -209,5 +212,15 @@ contract LeveragedAave is LeveragedStrategy {
     /// @dev Returns the market max LTV in basis points.
     function _getStrategyMaxLtvBps() internal view override returns (uint16 maxLtvBps) {
         maxLtvBps = _getMaxLtv().toUint16();
+    }
+
+    /// @dev Reverts on rescue of Aave receipt tokens:
+    /// - Aave collateral position (aToken)
+    /// - Variable debt position (variableDebtToken, technically non-transferable but rejected defensively).
+    function _validateRescueToken(address _token) internal view override {
+        LeveragedAaveStorage storage S = _getLeveragedAaveStorage();
+        if (_token == address(S.aToken) || _token == address(S.variableDebtToken)) {
+            revert LibError.InvalidToken();
+        }
     }
 }

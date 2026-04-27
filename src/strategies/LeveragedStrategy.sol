@@ -526,6 +526,12 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         emit SwapExecuted(address(tokenIn), address(tokenOut), srcAmount, destAmount);
     }
 
+    /// @dev Hook for inherited-contracts to reject lending-market receipt tokens (e.g. Aave aToken,
+    /// Euler vault shares, Silo share tokens) from being rescued. Default no-op.
+    /// Inherited-contracts MUST `revert LibError.InvalidToken()` when `_token` is a market receipt
+    /// whose transfer would result in the strategy's collateral or debt position being transferred
+    function _validateRescueToken(address _token) internal view virtual {}
+
     /// @dev Transfers any ERC20 tokens accidentally sent to the strategy to the admin.
     function _rescueTokens(address _token, uint256 _amount) internal {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
@@ -538,6 +544,8 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         ) {
             revert LibError.InvalidToken();
         }
+
+        _validateRescueToken(_token);
 
         IERC20(_token).safeTransfer(msg.sender, _amount);
         emit TokensRecovered(_token, _amount);

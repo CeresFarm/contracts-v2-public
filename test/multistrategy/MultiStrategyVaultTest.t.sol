@@ -420,6 +420,47 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         assertGt(vault.totalAllocated(), totalAllocatedBefore, "totalAllocated should increase after yield");
     }
 
+    /// @notice Test that `_reportStrategy` MUST refresh the vault's `totalAssets` so that the very next `deposit` 
+    /// mints shares at the post-yield PPS.
+    /// Without the trailing `_refreshTotalAssets()` an attacker could observe child yield,
+    /// deposit at the stale (pre-yield) PPS, then immediately request redeem after the
+    /// next refresh to extract a riskless premium proportional to the realized child yield.
+    function test_ReportStrategy_RefreshesVaultTotalAssets_ClosesDepositMEV() public {
+        // Seed the vault and auto-allocate to childA.
+        uint256 seed = 10_000 * 1e6;
+        _depositToVault(user1, seed);
+        assertEq(vault.totalAssets(), seed, "totalAssets should equal seed pre-yield");
+
+        // Simulate child yield and harvest the child so its stored totalAssets reflects it.
+        uint256 yieldAmount = 1_000 * 1e6; // 10% yield
+        asset.mint(address(childA), yieldAmount);
+        vm.prank(keeper);
+        childA.harvestAndReport();
+
+        _reportStrategy(address(childA));
+
+        uint256 totalAssetsAfterReport = vault.totalAssets();
+        assertGt(totalAssetsAfterReport, seed, "vault.totalAssets must reflect child yield after reportStrategy");
+
+        // A fresh depositor deposits immediately after `_reportStrategy`.
+        // The depositor's shares correspond to the POST-yield PPS so an immediate
+        // requestRedeem cannot extract any of the realized yield. This is also prevented
+        // partially by async withdrawals
+        uint256 attackerDeposit = 1_000 * 1e6;
+        _depositToVault(user2, attackerDeposit);
+
+        uint256 attackerShares = vault.balanceOf(user2);
+        uint256 attackerEntitledAssets = vault.convertToAssets(attackerShares);
+
+        // Allow 1 wei of rounding from the +1 virtual offset in _convertToShares.
+        assertApproxEqAbs(
+            attackerEntitledAssets,
+            attackerDeposit,
+            1,
+            "attacker share value must equal deposit"
+        );
+    }
+
     function testRevert_ReportStrategy_NotActive() public {
         vm.prank(keeper);
         vm.expectRevert(LibError.StrategyNotActive.selector);

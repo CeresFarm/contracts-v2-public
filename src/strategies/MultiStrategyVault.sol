@@ -108,6 +108,9 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     }
 
     /// @notice Returns the ordered list of strategies used when deallocating assets for withdrawals.
+    /// @dev Off-chain hint only. The contract does not consume this queue: keepers reference it
+    /// to decide the order of `requestDeallocate` calls on child strategies prior to invoking
+    /// `processCurrentRequest`. `_freeFunds` returns 0 on this vault by design (async children).
     /// @return Ordered array of strategy addresses for withdrawal deallocation.
     function getWithdrawQueue() external view returns (address[] memory) {
         return _getMultiStrategyVaultStorage().withdrawQueue;
@@ -350,6 +353,7 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
             S.totalAllocated -= loss;
         }
 
+        _refreshTotalAssets();
         emit StrategyReportedFromVault(strategy, previousAllocated, actualValue);
     }
 
@@ -358,8 +362,11 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @dev Auto-allocate deposited funds to the first strategy in the supply queue.
-    ///      Respects both the vault's allocation cap and the child strategy's deposit limit.
-    ///      If the strategy is at capacity or no strategies exist, funds remain idle.
+    /// Respects both the vault's allocation cap and the child strategy's deposit limit.
+    /// If the strategy is at capacity or no strategies exist, funds remain idle.
+    /// By design, only `supplyQueue[0]` is targeted: any overflow stays idle in the vault
+    /// and the curator must call `allocate(strategy, assets)` to spread across other queue
+    /// entries. This keeps the deposit path bounded in gas regardless of queue length.
     function _deployFunds(uint256 _amount) internal virtual override {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
         if (S.supplyQueue.length == 0) return;

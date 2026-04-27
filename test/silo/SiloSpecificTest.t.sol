@@ -7,6 +7,7 @@ import {console2} from "forge-std/Test.sol";
 import {LeveragedSilo} from "src/strategies/LeveragedSilo.sol";
 import {ILeveragedSilo} from "src/interfaces/strategies/ILeveragedSilo.sol";
 import {ISilo, ISiloConfig} from "src/interfaces/silo/ISilo.sol";
+import {LibError} from "src/libraries/LibError.sol";
 
 /// @title SiloSpecificTest
 /// @notice Tests specific to LeveragedSilo that don't apply to other protocols
@@ -148,5 +149,23 @@ contract SiloSpecificTest is SiloTestSetup {
 
         assertEq(savUSDPrice, SAVUSD_ORACLE_PRICE, "savUSD price mismatch");
         assertEq(usdcPrice, USDC_PRICE, "USDC price mismatch");
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                              RESCUE RECEIPT-TOKEN PROTECTION                              //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice Rescue must not be able to drain the Silo collateral share token (the silo itself).
+    function testRevert_RescueTokens_DepositSiloShares() public {
+        vm.prank(management);
+        vm.expectRevert(LibError.InvalidToken.selector);
+        strategy.executeOperation(4, 0, address(savUSDSilo));
+    }
+
+    /// @notice Rescue must not be able to transfer the Silo borrow share token.
+    function testRevert_RescueTokens_BorrowSiloShares() public {
+        vm.prank(management);
+        vm.expectRevert(LibError.InvalidToken.selector);
+        strategy.executeOperation(4, 0, address(usdcSilo));
     }
 }
