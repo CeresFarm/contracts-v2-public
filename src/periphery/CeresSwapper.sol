@@ -18,19 +18,27 @@ import {IPendleRouter} from "../interfaces/pendle/IPendleRouter.sol";
 contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
     using SafeERC20 for IERC20;
 
-    enum SwapType {
-        KYBERSWAP_AGGREGATOR,
-        PARASWAP_AGGREGATOR,
-        PENDLE_ROUTER
-    }
-
-    struct SwapProvider {
-        SwapType swapType;
-        address router;
-    }
-
     bytes32 public constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
     bytes32 public constant VAULT_OR_STRATEGY = keccak256("VAULT_OR_STRATEGY");
+
+    /// @notice Paraswap Augustus V6 selector for `swapExactAmountIn`.
+    /// @dev Used by `swapFrom` (exact-input swaps).
+    bytes4 public constant PARASWAP_SWAP_EXACT_AMOUNT_IN = 0xe3ead59e;
+
+    /// @notice Paraswap Augustus V6 selector for `swapExactAmountOut`.
+    /// @dev Used by `swapTo` (exact-output swaps).
+    bytes4 public constant PARASWAP_SWAP_EXACT_AMOUNT_OUT = 0x7f457675;
+
+    /// @notice Calldata offset of the `fromAmount` field in Paraswap `swapExactAmountIn`.
+    /// `fromAmount` is at calldata offset 100 according to Paraswap Notion docs at:
+    /// https://paraswap.notion.site/Dynamic-src-dest-amounts-on-AugustusV6-d23ad8f05e4f402aa906ab3f59763a87
+    uint256 internal constant PARASWAP_EXACT_AMOUNT_IN_OFFSET = 100;
+
+    /// @notice Calldata offset of the `toAmount` field in Paraswap `swapExactAmountOut`.
+    /// `toAmount` is at calldata offset 132 according to Paraswap Notion docs at:
+    /// https://paraswap.notion.site/Dynamic-src-dest-amounts-on-AugustusV6-d23ad8f05e4f402aa906ab3f59763a87
+    uint256 internal constant PARASWAP_EXACT_AMOUNT_OUT_OFFSET = 132;
+
     IAccessControlDefaultAdminRules public immutable ROLE_MANAGER;
 
     // tokenPairHash is a keccack256 hash of fromToken and toToken
@@ -48,6 +56,8 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
     );
 
     event SwapProviderSet(address indexed tokenIn, address indexed tokenOut, SwapProvider provider);
+
+    event TokensRecovered(address indexed token, uint256 amount);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                        MODIFIERS                                          //
@@ -118,8 +128,12 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         if (provider.swapType == SwapType.KYBERSWAP_AGGREGATOR) {
             _kyberswapAggregatorExactIn(provider.router, fromToken, amountIn, swapData);
         } else if (provider.swapType == SwapType.PARASWAP_AGGREGATOR) {
-            uint256 fromAmountOffset = _calculateParaswapAmountOffset(bytes4(swapData[:4]));
-            _paraswapAggregatorExactIn(provider.router, fromToken, amountIn, fromAmountOffset, swapData);
+            // Reject any selector other than `swapExactAmountIn` for an exact-in swap. This
+            // prevents a keeper from supplying `swapExactAmountOut` calldata, which would cause
+            // the runtime amount to be written into the `toAmount` field and execute an
+            // unintended exact-out buy with off-spec slippage / refund semantics.
+            if (bytes4(swapData[:4]) != PARASWAP_SWAP_EXACT_AMOUNT_IN) revert LibError.InvalidSwapSelector();
+            _paraswapAggregatorExactIn(provider.router, fromToken, amountIn, PARASWAP_EXACT_AMOUNT_IN_OFFSET, swapData);
         } else if (provider.swapType == SwapType.PENDLE_ROUTER) {
             _pendleRouterSwap(provider.router, fromToken, amountIn, swapData);
         } else {
@@ -166,8 +180,20 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         IERC20(fromToken).safeTransferFrom(msg.sender, address(this), maxAmountIn);
 
         if (provider.swapType == SwapType.PARASWAP_AGGREGATOR) {
-            uint256 toAmountOffset = _calculateParaswapAmountOffset(bytes4(swapData[:4]));
-            _paraswapAggregatorExactOut(provider.router, fromToken, maxAmountIn, amountOut, toAmountOffset, swapData);
+            // Reject any selector other than `swapExactAmountOut` for an exact-out swap. This
+            // prevents a keeper from supplying `swapExactAmountIn` calldata, which would cause
+            // the runtime amount to be written into the `fromAmount` field and execute an
+            // unintended exact-in sell with off-spec semantics (post-call min-out check would
+            // still pass while the spend/refund accounting silently changes shape).
+            if (bytes4(swapData[:4]) != PARASWAP_SWAP_EXACT_AMOUNT_OUT) revert LibError.InvalidSwapSelector();
+            _paraswapAggregatorExactOut(
+                provider.router,
+                fromToken,
+                maxAmountIn,
+                amountOut,
+                PARASWAP_EXACT_AMOUNT_OUT_OFFSET,
+                swapData
+            );
         } else {
             // Pendle and Kyberswap DO NOT SUPPORT `exactOut` swaps
             revert LibError.InvalidSwapConfig();
@@ -216,6 +242,16 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         return keccak256(abi.encodePacked(_fromToken, _toToken));
     }
 
+    /// @notice Recovers any ERC20 tokens mistakenly sent to or left in the swapper.
+    /// @dev Gated by `MANAGEMENT_ROLE`. Tokens are sent to `msg.sender` so the caller
+    /// (management EOA / multisig) custodies them
+    /// @param _token Address of the token to rescue.
+    function rescueTokens(address _token) external onlyRole(MANAGEMENT_ROLE) nonReentrant {
+        uint256 amount = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).safeTransfer(msg.sender, amount);
+        emit TokensRecovered(_token, amount);
+    }
+
     /*//////////////////////////////////////////////////////////////
                         Kyberswap Functions
     //////////////////////////////////////////////////////////////*/
@@ -257,25 +293,6 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
     /*//////////////////////////////////////////////////////////////
                         Paraswap Functions
     //////////////////////////////////////////////////////////////*/
-
-    /// @notice Returns the calldata byte offset of the amount field for a given Paraswap function selector.
-    /// @dev Used to overwrite the encoded amount in Paraswap calldata with the actual runtime amount.
-    /// @param selector The 4-byte function selector from the Paraswap calldata.
-    /// @return The byte offset of the amount field within the calldata.
-    function _calculateParaswapAmountOffset(bytes4 selector) public pure returns (uint256) {
-        // Function Selectors from documentation
-        // https://paraswap.notion.site/Dynamic-src-dest-amounts-on-AugustusV6-d23ad8f05e4f402aa906ab3f59763a87
-        bytes4 PARASWAP_SWAP_EXACT_AMOUNT_IN = 0xe3ead59e;
-        bytes4 PARASWAP_SWAP_EXACT_AMOUNT_OUT = 0x7f457675;
-
-        if (selector == PARASWAP_SWAP_EXACT_AMOUNT_IN) {
-            return 100;
-        } else if (selector == PARASWAP_SWAP_EXACT_AMOUNT_OUT) {
-            return 132;
-        } else {
-            revert LibError.InvalidSwapSelector();
-        }
-    }
 
     /// @notice Internal function to swap tokens using Paraswap aggregator.
     /// @param router The address of the Paraswap router.

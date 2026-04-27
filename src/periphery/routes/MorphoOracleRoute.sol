@@ -47,8 +47,7 @@ contract MorphoOracleRoute is IOracleRoute {
     function getQuote(uint256 amountIn, address tokenIn, address tokenOut) external view returns (uint256) {
         // Forward quote: Collateral to Loan
         if (tokenIn == COLLATERAL_TOKEN && tokenOut == LOAN_TOKEN) {
-            uint256 price = ORACLE.price();
-            if (price == 0) revert LibError.InvalidPrice();
+            uint256 price = _fetchPrice();
 
             uint256 amountOut = amountIn.mulDiv(price, MORPHO_ORACLE_PRECISION);
             if (amountOut == 0) revert LibError.ZeroOutputAmount();
@@ -57,8 +56,7 @@ contract MorphoOracleRoute is IOracleRoute {
 
         // Inverse quote: Loan to Collateral
         if (tokenIn == LOAN_TOKEN && tokenOut == COLLATERAL_TOKEN) {
-            uint256 price = ORACLE.price();
-            if (price == 0) revert LibError.InvalidPrice();
+            uint256 price = _fetchPrice();
 
             uint256 amountOut = amountIn.mulDiv(MORPHO_ORACLE_PRECISION, price);
             if (amountOut == 0) revert LibError.ZeroOutputAmount();
@@ -66,5 +64,15 @@ contract MorphoOracleRoute is IOracleRoute {
         }
 
         revert LibError.InvalidOracleRoute();
+    }
+
+    /// @dev Wraps `ORACLE.price()` in try/catch and converts any revert to `LibError.OracleError`
+    function _fetchPrice() internal view returns (uint256) {
+        try ORACLE.price() returns (uint256 price) {
+            if (price == 0) revert LibError.InvalidPrice();
+            return price;
+        } catch {
+            revert LibError.OracleError();
+        }
     }
 }

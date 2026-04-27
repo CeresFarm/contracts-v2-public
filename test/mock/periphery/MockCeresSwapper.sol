@@ -55,6 +55,10 @@ contract MockCeresSwapper is ICeresSwapper {
         shouldFailSlippage = _shouldFail;
     }
 
+    function setSwapProvider(address fromToken, address toToken, SwapProvider calldata provider) external {
+        // No-op for mock
+    }
+
     /// @notice Swap exact amount of fromToken for at least minAmountOut of toToken
     function swapFrom(
         address fromToken,

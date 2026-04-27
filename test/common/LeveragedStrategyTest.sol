@@ -1028,7 +1028,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         // Set higher slippage on swapper to simulate insufficient debt tokens after swap
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (300, 1500, MAX_LOSS_BPS, address(0)))
+            abi.encodeCall(strategy.updateConfig, (300, 1500, MAX_LOSS_BPS, feeReceiver))
         );
 
         swapper.setSlippage(310); // 3.1% slippage - will return less than expected
@@ -1299,7 +1299,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         (, uint16 performanceFeeBps, uint16 maxLossBps, , , ) = strategy.getConfig();
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (10, performanceFeeBps, maxLossBps, address(0))) // 0.1%
+            abi.encodeCall(strategy.updateConfig, (10, performanceFeeBps, maxLossBps, feeReceiver)) // 0.1%
         );
 
         // Set high swapper slippage
@@ -1343,11 +1343,65 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         emit ICeresBaseVault.ConfigUpdated();
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (newSlippage, 1500, MAX_LOSS_BPS, address(0)))
+            abi.encodeCall(strategy.updateConfig, (newSlippage, 1500, MAX_LOSS_BPS, feeReceiver))
         );
 
         (uint16 maxSlippageBps, , , , , ) = strategy.getConfig();
         assertEq(maxSlippageBps, newSlippage, "Max slippage should be updated");
+    }
+
+    /// @dev Verifies that passing address(0) to updateConfig clears `performanceFeeRecipient`
+    /// and that subsequent harvests do not mint fee shares while the recipient is unset.
+    /// Also verifies that re-setting a non-zero recipient re-enables fee minting.
+    function test_UpdateConfig_DisableFees_ViaZeroRecipient() public {
+        (uint16 maxSlippageBps, uint16 performanceFeeBps, uint16 maxLossBps, , address recipientBefore, ) = strategy
+            .getConfig();
+        assertEq(recipientBefore, feeReceiver, "recipient is feeReceiver");
+        assertGt(performanceFeeBps, 0, "fees enabled");
+
+        // Step 1: clear the recipient via updateConfig(address(0)).
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, performanceFeeBps, maxLossBps, address(0)))
+        );
+
+        (, , , , address recipientAfterClear, ) = strategy.getConfig();
+        assertEq(recipientAfterClear, address(0), "recipient should be zeroed");
+
+        // Step 2: generate profit and harvest. No fee shares should be minted to the old recipient.
+        uint256 depositAmount = DEFAULT_DEPOSIT();
+        _setupUserDeposit(user1, depositAmount);
+
+        uint256 feeReceiverSharesBefore = strategy.balanceOf(feeReceiver);
+
+        uint256 toAirdrop = (depositAmount * 500) / BPS_PRECISION; // 5% profit
+        assetToken.mint(address(strategy), toAirdrop);
+
+        vm.prank(keeper);
+        strategy.harvestAndReport();
+
+        assertEq(
+            strategy.balanceOf(feeReceiver),
+            feeReceiverSharesBefore,
+            "no fee shares should mint while recipient is zero"
+        );
+
+        // Step 3: re-enable by setting recipient back; subsequent profits should mint fee shares.
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, performanceFeeBps, maxLossBps, feeReceiver))
+        );
+
+        assetToken.mint(address(strategy), toAirdrop);
+
+        vm.prank(keeper);
+        strategy.harvestAndReport();
+
+        assertGt(
+            strategy.balanceOf(feeReceiver),
+            feeReceiverSharesBefore,
+            "fee shares should mint after re-enabling recipient"
+        );
     }
 
     function test_SetDepositAndRedeemLimit_Success() public {
@@ -1589,7 +1643,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
 
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, 10_00, maxLossBps, address(0)))
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, 10_00, maxLossBps, feeReceiver))
         );
 
         // Deposit into strategy

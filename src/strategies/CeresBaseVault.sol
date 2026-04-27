@@ -552,7 +552,7 @@ abstract contract CeresBaseVault is
     /// @param _maxSlippageBps Maximum allowed swap slippage in basis points.
     /// @param _performanceFeeBps Performance fee rate in basis points.
     /// @param _maxLossBps Maximum tolerated loss when processing a redeem batch, in basis points.
-    /// @param _performanceFeeRecipient Address that receives minted performance fee shares (ignored if zero).
+    /// @param _performanceFeeRecipient Address that receives minted performance fee shares. Set to address(0) to disable fees.
     function updateConfig(
         uint16 _maxSlippageBps,
         uint16 _performanceFeeBps,
@@ -567,10 +567,7 @@ abstract contract CeresBaseVault is
         S.maxSlippageBps = _maxSlippageBps;
         S.performanceFeeBps = _performanceFeeBps;
         S.maxLossBps = _maxLossBps;
-
-        if (_performanceFeeRecipient != address(0)) {
-            S.performanceFeeRecipient = _performanceFeeRecipient;
-        }
+        S.performanceFeeRecipient = _performanceFeeRecipient;
 
         emit ConfigUpdated();
     }
@@ -790,10 +787,10 @@ abstract contract CeresBaseVault is
 
         if (currentAssets > prevAssets) {
             profit = currentAssets - prevAssets;
-            cumulative += int128(profit.toUint128());
+            cumulative += SafeCast.toInt128(SafeCast.toInt256(profit));
         } else {
             loss = prevAssets - currentAssets;
-            cumulative -= int128(loss.toUint128());
+            cumulative -= SafeCast.toInt128(SafeCast.toInt256(loss));
         }
 
         S.cumulativeNetProfit = cumulative;
