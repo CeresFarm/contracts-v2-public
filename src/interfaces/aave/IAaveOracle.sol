@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.0;
 
 /// @title IAaveOracle
 /// @notice Minimal interface for the Aave price oracle (AaveOracle).

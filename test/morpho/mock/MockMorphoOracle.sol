@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IOracle} from "morpho-blue/interfaces/IOracle.sol";
 import {LibError} from "src/libraries/LibError.sol";

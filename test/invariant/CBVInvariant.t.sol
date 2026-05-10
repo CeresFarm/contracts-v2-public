@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
@@ -112,7 +112,7 @@ contract CBVInvariant is Test {
         timelockHelper.runViaTimelock(
             timelock,
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient)),
+            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient, uint32(1 days))),
             management
         );
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
@@ -93,7 +93,7 @@ contract LeveragedStrategyInvariant is Test {
             management,
             abi.encodeCall(
                 MockLeveragedStrategy.initialize,
-                (address(assetToken), address(debtToken), address(roleManager))
+                (address(assetToken), address(assetToken), address(debtToken), address(roleManager))
             )
         );
         strategy = MockLeveragedStrategy(proxy);
@@ -126,7 +126,7 @@ contract LeveragedStrategyInvariant is Test {
         timelockHelper.runViaTimelock(
             timelock,
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient)),
+            abi.encodeCall(strategy.updateConfig, (25, 1500, 200, feeRecipient, uint32(1 days))),
             management
         );
 

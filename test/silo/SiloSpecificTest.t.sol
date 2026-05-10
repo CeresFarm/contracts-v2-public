@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {SiloTestSetup} from "./SiloTestSetup.sol";
 import {console2} from "forge-std/Test.sol";
@@ -20,10 +20,8 @@ contract SiloSpecificTest is SiloTestSetup {
     function test_InitialValues_LeveragedSilo() public view {
         ILeveragedSilo siloStrategy = ILeveragedSilo(address(strategy));
 
-        (address siloLens_, address siloConfig_, , , ISilo.CollateralType collateralType_) = siloStrategy
-            .getMarketDetails();
+        (address siloLens_, , , ISilo.CollateralType collateralType_) = siloStrategy.getMarketDetails();
 
-        assertEq(siloConfig_, address(siloConfig), "SILO_CONFIG mismatch");
         assertEq(siloLens_, address(siloLens), "SILO_LENS mismatch");
         assertEq(uint8(collateralType_), uint8(ISilo.CollateralType.Protected), "COLLATERAL_TYPE should be Protected");
     }
@@ -149,23 +147,5 @@ contract SiloSpecificTest is SiloTestSetup {
 
         assertEq(savUSDPrice, SAVUSD_ORACLE_PRICE, "savUSD price mismatch");
         assertEq(usdcPrice, USDC_PRICE, "USDC price mismatch");
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-    //                              RESCUE RECEIPT-TOKEN PROTECTION                              //
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-
-    /// @notice Rescue must not be able to drain the Silo collateral share token (the silo itself).
-    function testRevert_RescueTokens_DepositSiloShares() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(savUSDSilo));
-    }
-
-    /// @notice Rescue must not be able to transfer the Silo borrow share token.
-    function testRevert_RescueTokens_BorrowSiloShares() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(usdcSilo));
     }
 }

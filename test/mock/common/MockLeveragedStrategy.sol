@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {Math} from "@openzeppelin-contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin-contracts/utils/math/SafeCast.sol";
@@ -32,12 +32,17 @@ contract MockLeveragedStrategy is LeveragedStrategy {
     //                               CONSTRUCTOR/INITIALIZERS                                    //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function initialize(address assetToken_, address debtToken_, address roleManager_) external initializer {
+    function initialize(
+        address assetToken_,
+        address collateralToken_,
+        address debtToken_,
+        address roleManager_
+    ) external initializer {
         __LeveragedStrategy_init(
             assetToken_,
             "Ceres Mock Leveraged Vault",
             "ceres-MOCK",
-            assetToken_, // collateral == asset -> isAssetCollateral = true
+            collateralToken_,
             debtToken_,
             roleManager_
         );
@@ -48,13 +53,13 @@ contract MockLeveragedStrategy is LeveragedStrategy {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     function _depositCollateral(uint256 amount) internal override {
-        MockERC20(asset()).burn(address(this), amount);
+        MockERC20(address(COLLATERAL_TOKEN())).burn(address(this), amount);
         marketCollateral += amount;
     }
 
     function _withdrawCollateral(uint256 amount) internal override {
         marketCollateral -= amount;
-        MockERC20(asset()).mint(address(this), amount);
+        MockERC20(address(COLLATERAL_TOKEN())).mint(address(this), amount);
     }
 
     function _borrowFromMarket(uint256 amount) internal override {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IEVC} from "src/interfaces/euler/IEVC.sol";
 
@@ -9,13 +9,13 @@ import {IEVC} from "src/interfaces/euler/IEVC.sol";
 contract MockEVC is IEVC {
     // Mapping to track enabled collaterals for each account
     mapping(address account => mapping(address vault => bool enabled)) private collaterals;
-    
+
     // Mapping to track enabled controllers for each account
     mapping(address account => mapping(address vault => bool enabled)) private controllers;
-    
+
     // Mapping to store collaterals array for each account
     mapping(address account => address[] vaults) private collateralsList;
-    
+
     // Mapping to store controllers array for each account
     mapping(address account => address[] vaults) private controllersList;
 
@@ -158,22 +158,27 @@ contract MockEVC is IEVC {
 
     function reorderCollaterals(address, uint8, uint8) external payable override {}
 
-    function permit(address, address, uint256, uint256, uint256, uint256, bytes calldata, bytes calldata)
-        external
-        payable
-        override
-    {}
+    function permit(
+        address,
+        address,
+        uint256,
+        uint256,
+        uint256,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external payable override {}
 
     function call(address, address, uint256, bytes calldata) external payable override returns (bytes memory) {
         return "";
     }
 
-    function controlCollateral(address, address, uint256, bytes calldata)
-        external
-        payable
-        override
-        returns (bytes memory)
-    {
+    function controlCollateral(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external payable override returns (bytes memory) {
         return "";
     }
 
@@ -181,7 +186,9 @@ contract MockEVC is IEVC {
 
     function batchRevert(BatchItem[] calldata) external payable override {}
 
-    function batchSimulation(BatchItem[] calldata)
+    function batchSimulation(
+        BatchItem[] calldata
+    )
         external
         payable
         override

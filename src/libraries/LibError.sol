@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 /// @notice Central registry of custom errors used across all Ceres contracts.
 library LibError {

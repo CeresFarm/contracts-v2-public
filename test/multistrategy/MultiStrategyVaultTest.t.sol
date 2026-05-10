@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
@@ -30,6 +30,12 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                    INITIAL STATE TESTS                                    //
     ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    function test_StorageLocationInvariant() public pure {
+        bytes32 storageLocation = keccak256(abi.encode(uint256(keccak256("ceres.storage.MultiStrategyVault")) - 1)) &
+            ~bytes32(uint256(0xff));
+        assertEq(uint256(storageLocation), uint256(0xec419cbfd5c3ba05e0e140d724d3979ed64708595283fbb576f70849e3c9b300));
+    }
 
     function test_InitialState() public view {
         assertEq(vault.asset(), address(asset), "asset mismatch");
@@ -371,13 +377,13 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         // No request pending
         vm.prank(curator);
         vm.expectRevert(LibError.ZeroShares.selector);
-        vault.claimDeallocated(address(childA));
+        vault.claimDeallocated(address(childA), 0);
     }
 
     function testRevert_ClaimDeallocated_Unauthorized() public {
         vm.prank(user1);
         vm.expectRevert(LibError.Unauthorized.selector);
-        vault.claimDeallocated(address(childA));
+        vault.claimDeallocated(address(childA), 0);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -420,7 +426,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         assertGt(vault.totalAllocated(), totalAllocatedBefore, "totalAllocated should increase after yield");
     }
 
-    /// @notice Test that `_reportStrategy` MUST refresh the vault's `totalAssets` so that the very next `deposit` 
+    /// @notice Test that `_reportStrategy` MUST refresh the vault's `totalAssets` so that the very next `deposit`
     /// mints shares at the post-yield PPS.
     /// Without the trailing `_refreshTotalAssets()` an attacker could observe child yield,
     /// deposit at the stale (pre-yield) PPS, then immediately request redeem after the
@@ -453,12 +459,7 @@ contract MultiStrategyVaultTest is MultiStrategyVaultSetup {
         uint256 attackerEntitledAssets = vault.convertToAssets(attackerShares);
 
         // Allow 1 wei of rounding from the +1 virtual offset in _convertToShares.
-        assertApproxEqAbs(
-            attackerEntitledAssets,
-            attackerDeposit,
-            1,
-            "attacker share value must equal deposit"
-        );
+        assertApproxEqAbs(attackerEntitledAssets, attackerDeposit, 1, "attacker share value must equal deposit");
     }
 
     function testRevert_ReportStrategy_NotActive() public {

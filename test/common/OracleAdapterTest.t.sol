@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20Metadata} from "@openzeppelin-contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -135,8 +135,14 @@ contract OracleAdapterTest is Test {
         // Sometimes extreme drop of `amountIn` results to 0, ignore such values
         if (assetEquivalent == 0) return;
 
-        // Convert the exact asset equivalent back to collateral
-        uint256 collConvertedResult = adapter.convertAssetsToCollateral(assetEquivalent);
+        // Convert the exact asset equivalent back to collateral.
+        // With extreme prices, the inverse may round to 0 (now a revert) — skip those cases.
+        uint256 collConvertedResult;
+        try adapter.convertAssetsToCollateral(assetEquivalent) returns (uint256 r) {
+            collConvertedResult = r;
+        } catch {
+            return;
+        }
 
         if (assetEquivalent > 10 ** assetToken.decimals()) {
             // For large amounts, we can expect some slippage due to rounding, but it should be minimal

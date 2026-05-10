@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IEulerOracle} from "src/interfaces/euler/IEulerOracle.sol";
 import {ERC20} from "@openzeppelin-contracts/token/ERC20/ERC20.sol";
@@ -11,14 +11,14 @@ import {LibError} from "src/libraries/LibError.sol";
 /// @dev Allows setting custom prices for token pairs and simulating oracle failures
 contract MockEulerOracle is IEulerOracle {
     string public constant override name = "Mock Euler Oracle";
-    
+
     /// @notice Precision used for price quotes (1e18)
     uint256 public constant ORACLE_PRECISION = 1e18;
 
     /// @notice Mapping to store prices: base token => quote token => price
     /// @dev Price represents how much quote token you get for 1 unit of base token (scaled by ORACLE_PRECISION)
     mapping(address => mapping(address => uint256)) public prices;
-    
+
     /// @notice Flag to simulate oracle failures
     bool public shouldRevert;
 
@@ -41,7 +41,11 @@ contract MockEulerOracle is IEulerOracle {
     /// @param base The token being priced
     /// @param quote The token that is the unit of account
     /// @return outAmount The equivalent amount in quote token
-    function getQuote(uint256 inAmount, address base, address quote) external view override returns (uint256 outAmount) {
+    function getQuote(
+        uint256 inAmount,
+        address base,
+        address quote
+    ) external view override returns (uint256 outAmount) {
         if (shouldRevert) revert LibError.OracleError();
 
         // If base and quote are the same, return the same amount
@@ -68,12 +72,11 @@ contract MockEulerOracle is IEulerOracle {
     /// @param quote The token that is the unit of account
     /// @return bidOutAmount The amount you would get for selling base
     /// @return askOutAmount The amount you would spend for buying base
-    function getQuotes(uint256 inAmount, address base, address quote)
-        external
-        view
-        override
-        returns (uint256 bidOutAmount, uint256 askOutAmount)
-    {
+    function getQuotes(
+        uint256 inAmount,
+        address base,
+        address quote
+    ) external view override returns (uint256 bidOutAmount, uint256 askOutAmount) {
         if (shouldRevert) revert LibError.OracleError();
 
         // If base and quote are the same, return the same amount for both

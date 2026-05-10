@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
@@ -139,17 +139,18 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     ) external nonReentrant onlyRole(KEEPER_ROLE) {
         _enforceKeeperDelay();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
+        IERC20 assetToken = IERC20(asset());
 
         // Revert if the asset and collateral is the same
         // As asset(collateral) is supplied during deposit and no swap is required
         if (S.isAssetCollateral) revert LibError.InvalidAction();
 
         // Validate that assets marked for withdrawals are not used
-        if (assetAmount > _getSelfBalance(IERC20(asset())) - withdrawalReserve()) revert LibError.InsufficientAssets();
+        if (assetAmount > _getSelfBalance(assetToken) - withdrawalReserve()) revert LibError.InsufficientAssets();
 
         uint256 amountInCollateral = S.oracleAdapter.convertAssetsToCollateral(assetAmount);
         uint256 collateralReceived = _executeSwap(
-            IERC20(asset()),
+            assetToken,
             S.collateralToken,
             assetAmount,
             amountInCollateral,
@@ -158,7 +159,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         );
         _depositCollateral(_getSelfBalance(S.collateralToken));
 
-        _harvestAndReport();
+        _processReport();
         emit SwapDepositCollateral(assetAmount, collateralReceived);
     }
 
@@ -201,12 +202,14 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         // Validate that strategy LTV is within limits after rebalance
         _validateStrategyLtv();
 
-        _harvestAndReport();
+        _processReport();
         emit Rebalance(msg.sender, amount, isLeverageUp, useFlashLoan);
     }
 
     /// @notice Flash loan callback invoked by the FlashLoanRouter after funds are transferred.
     /// @dev Executes the leverage-up or leverage-down logic and repays the flash loan.
+    /// For Leverage-up: Swaps FL amount to collateral -> deposit collateral -> borrow debt -> repay flash loan
+    /// For Leverage-down: Repay debt using FL amount -> withdraw collateral -> swap collateral to debt -> repay flash loan
     /// Borrows additional debt if the strategy does not hold enough to cover repayment + fee.
     /// @param token The borrowed token address.
     /// @param amount The borrowed amount.
@@ -302,7 +305,7 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
             netAssets += assetBalance + collateralInAssets;
         }
 
-        uint256 debtTokenBalance = 0;
+        uint256 debtTokenBalance; // Initialized to 0 by default, saves a MSTORE
         // When asset == debtToken, the balance is already counted as assetBalance above.
         // When collateral == debtToken(highly unlikely), the balance is already counted in totalCollateral above.
         if (debtToken != assetToken && debtToken != address(S.collateralToken)) {
@@ -432,9 +435,8 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     function setOracleAdapter(address _oracleAdapter) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
         if (_oracleAdapter == address(0)) revert LibError.InvalidAddress();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        address oldAddress = address(S.oracleAdapter);
         S.oracleAdapter = IOracleAdapter(_oracleAdapter);
-        emit OracleAdapterUpdated(oldAddress, _oracleAdapter);
+        emit OracleAdapterUpdated(_oracleAdapter);
     }
 
     /// @notice Sets a new swapper.
@@ -443,9 +445,8 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     function setSwapper(address _swapper) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
         if (_swapper == address(0)) revert LibError.InvalidAddress();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        address oldAddress = address(S.swapper);
         S.swapper = ICeresSwapper(_swapper);
-        emit SwapperUpdated(oldAddress, _swapper);
+        emit SwapperUpdated(_swapper);
     }
 
     /// @notice Sets a new flash loan router.
@@ -454,9 +455,8 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     function setFlashLoanRouter(address _flashLoanRouter) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
         if (_flashLoanRouter == address(0)) revert LibError.InvalidAddress();
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        address oldAddress = address(S.flashLoanRouter);
         S.flashLoanRouter = IFlashLoanRouter(_flashLoanRouter);
-        emit FlashLoanRouterUpdated(oldAddress, _flashLoanRouter);
+        emit FlashLoanRouterUpdated(_flashLoanRouter);
     }
 
     /// @notice Sets the delay between consecutive keeper actions.
@@ -464,25 +464,24 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
     /// @param _keeperDelay New delay in seconds applied to keeper-only entry points.
     function setKeeperDelay(uint48 _keeperDelay) external onlyRole(TIMELOCKED_ADMIN_ROLE) {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        uint48 oldDelay = S.keeperDelay;
         S.keeperDelay = _keeperDelay;
-        emit KeeperDelayUpdated(oldDelay, _keeperDelay);
+        emit KeeperDelayUpdated(_keeperDelay);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                          ADMIN FUNCTIONS: EMERGENCY ACTIONS                               //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Directly executes a market operation for emergency use or rescues stuck tokens.
-    /// @dev Validates LTV after market operations and triggers a harvest/report.
-    /// @param operationType 0 = deposit collateral, 1 = withdraw collateral, 2 = borrow, 3 = repay, 4 = rescue tokens.
+    /// @notice Directly executes a market operation for time-sensitive emergency rebalancing.
+    /// @dev Gated by `EMERGENCY_ADMIN_ROLE` so it can fire promptly during incidents (depeg,
+    /// liquidation cascade) without a timelock delay.
+    /// Validates LTV after market operations and triggers a harvest/report.
+    /// @param operationType 0 = deposit collateral, 1 = withdraw collateral, 2 = borrow, 3 = repay.
     /// @param amount The amount to execute with
-    /// @param token Address used only for rescue (operationType 4); pass address(0) otherwise.
     function executeOperation(
         uint8 operationType,
-        uint256 amount,
-        address token
-    ) external nonReentrant onlyRole(MANAGEMENT_ROLE) {
+        uint256 amount
+    ) external nonReentrant onlyRole(EMERGENCY_ADMIN_ROLE) {
         if (operationType == 0) {
             _depositCollateral(amount);
         } else if (operationType == 1) {
@@ -491,20 +490,18 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
             _borrowFromMarket(amount);
         } else if (operationType == 3) {
             _repayDebt(amount);
-        } else if (operationType == 4) {
-            _rescueTokens(token, amount);
-            return; // skip LTV validation and harvest for rescue
         } else {
             revert LibError.InvalidAction();
         }
 
         _validateStrategyLtv();
-        _harvestAndReport();
+        _processReport();
         emit MarketOperationExecuted(operationType, amount);
     }
 
     /// @notice Executes a swap between two tokens held by the strategy for emergency re-balancing.
-    /// @dev Validates by triggering harvest/report after the swap.
+    /// @dev Gated by `EMERGENCY_ADMIN_ROLE` for the same reason as {executeOperation}
+    /// Validates by triggering harvest/report after the swap.
     /// @param tokenIn The token to sell.
     /// @param tokenOut The token to receive.
     /// @param srcAmount Amount of `tokenIn` to sell.
@@ -519,21 +516,31 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         uint256 srcAmountInDestToken,
         bool useExactOut,
         bytes calldata swapData
-    ) external nonReentrant onlyRole(MANAGEMENT_ROLE) returns (uint256 destAmount) {
+    ) external nonReentrant onlyRole(EMERGENCY_ADMIN_ROLE) returns (uint256 destAmount) {
         destAmount = _executeSwap(tokenIn, tokenOut, srcAmount, srcAmountInDestToken, useExactOut, swapData);
 
-        _harvestAndReport();
+        _processReport();
         emit SwapExecuted(address(tokenIn), address(tokenOut), srcAmount, destAmount);
     }
 
-    /// @dev Hook for inherited-contracts to reject lending-market receipt tokens (e.g. Aave aToken,
-    /// Euler vault shares, Silo share tokens) from being rescued. Default no-op.
-    /// Inherited-contracts MUST `revert LibError.InvalidToken()` when `_token` is a market receipt
-    /// whose transfer would result in the strategy's collateral or debt position being transferred
-    function _validateRescueToken(address _token) internal view virtual {}
+    /// @notice Rescue tokens that are accidentally sent to the strategy contract.
+    /// @dev Cannot be used to transfer out asset, collateral, or debt tokens.
+    /// Tokens can be rescued only after the timelock. The destination is named explicitly so the
+    /// scheduled timelock proposal records who receives the funds (rather than implicitly sending
+    /// them to the timelock contract itself, which would require a follow-up forwarding proposal).
+    /// @param _token The address of the token to rescue.
+    /// @param _amount The amount of the token to rescue.
+    /// @param _to The address that receives the rescued tokens.
+    function rescueTokens(
+        address _token,
+        uint256 _amount,
+        address _to
+    ) external nonReentrant onlyRole(TIMELOCKED_ADMIN_ROLE) {
+        _rescueTokens(_token, _amount, _to);
+    }
 
-    /// @dev Transfers any ERC20 tokens accidentally sent to the strategy to the admin.
-    function _rescueTokens(address _token, uint256 _amount) internal {
+    /// @dev Transfers any ERC20 tokens accidentally sent to the strategy to `_to`.
+    function _rescueTokens(address _token, uint256 _amount, address _to) internal {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
 
         if (
@@ -544,20 +551,18 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         ) {
             revert LibError.InvalidToken();
         }
+        if (_to == address(0)) revert LibError.ZeroAddress();
 
-        _validateRescueToken(_token);
-
-        IERC20(_token).safeTransfer(msg.sender, _amount);
-        emit TokensRecovered(_token, _amount);
+        IERC20(_token).safeTransfer(_to, _amount);
+        emit TokensRecovered(_token, _amount, _to);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                      INTERNAL OVERRIDES                                   //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function _onProcessRequest(bytes calldata /* extraData */) internal virtual override {
+    function _beforeProcessReport() internal virtual override {
         _enforceKeeperDelay();
-        _harvestAndReport();
     }
 
     /// @dev If asset == collateral, deposits directly into the lending market. Otherwise,
@@ -580,28 +585,27 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
 
     /// @dev Unwinds the strategy's leverage to free `_amount` of asset tokens.
     /// Uses a flash loan to repay outstanding debt, then withdraws collateral.
+    /// @dev Blind execution hook: the actual cash freed and the unwind cost (slippage,
+    /// FL fees, oracle/AMM divergence, deleveraging cost) are measured top-down by
+    /// `processCurrentRequest` via `_reportTotalAssets()` and idle-balance snapshots taken
+    /// around this call. Any exactIn buffer (in debt-token form) intentionally remains in the
+    /// strategy and is naturally credited back to remaining holders by the next `_processReport`.
     /// @param _amount Target asset-token amount to free.
     /// @param extraData ABI-encoded (flashLoanAmount, flashLoanSwapData, collateralToAssetSwapData).
-    /// @return actualFreed Actual asset tokens freed (may be less than `_amount` due to slippage).
-    function _freeFunds(
-        uint256 _amount,
-        bytes calldata extraData
-    ) internal virtual override returns (uint256 actualFreed) {
+    function _freeFunds(uint256 _amount, bytes calldata extraData) internal virtual override {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
-        uint256 assetBalance = _getSelfBalance(IERC20(asset()));
 
-        // extraData: (uint256 flashLoanAmount, bytes flashLoanSwapData, bytes collateralToAssetSwapData)
+        // extraData: (uint256 flashLoanAmount, bytes collateralToDebtSwapData, bytes collateralToAssetSwapData)
         // For isAssetCollateral strategies, collateralToAssetSwapData is empty bytes and unused
-        (uint256 flashLoanAmount, bytes memory flashLoanSwapData, bytes memory collateralToAssetSwapData) = abi.decode(
-            extraData,
-            (uint256, bytes, bytes)
-        );
+        (uint256 flashLoanAmount, bytes memory collateralToDebtSwapData, bytes memory collateralToAssetSwapData) = abi
+            .decode(extraData, (uint256, bytes, bytes));
 
         if (S.isAssetCollateral) {
-            _unwindCollateral(_amount, flashLoanAmount, flashLoanSwapData);
+            // Assets are received directly during collateral withdrawal.
+            _unwindCollateral(_amount, flashLoanAmount, collateralToDebtSwapData);
         } else {
             uint256 collateralToFree = S.oracleAdapter.convertAssetsToCollateral(_amount);
-            uint256 collateralFreed = _unwindCollateral(collateralToFree, flashLoanAmount, flashLoanSwapData);
+            uint256 collateralFreed = _unwindCollateral(collateralToFree, flashLoanAmount, collateralToDebtSwapData);
 
             if (collateralFreed > 0) {
                 uint256 amountInAsset = S.oracleAdapter.convertCollateralToAssets(collateralFreed);
@@ -619,20 +623,22 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         // Validate LTV to ensure the strategy is not pushed into an unsafe state
         // if the keeper provided an insufficient flashLoanAmount for deleveraging.
         _validateStrategyLtv();
-
-        actualFreed = _getSelfBalance(IERC20(asset())) - assetBalance;
     }
 
     /// @dev Uses a flash loan to repay debt and release collateral. With exact-output swaps enabled,
     /// the swapper may refund unused collateral which is credited against the remaining withdrawal target.
+    /// If exactOut swaps are not available, exactIn swap is used. This results in all collateral being swapped to Debt
+    /// without any refund from swapper of the buffer amount (which is received in case of `exactOut`).
+    /// This additional buffer collateral (slippage buffer) remains in the strategy in the form of DebtTokens.
+    /// The total vault value (netAssets) remains the same
     /// @param collateralToFree Target collateral amount to release.
     /// @param flashLoanAmount Debt token amount to flash-borrow for the leverage-down.
-    /// @param flashLoanSwapData Swap calldata for the collateral-to-debt swap inside the flash loan.
+    /// @param collateralToDebtSwapData Swap calldata for the collateral-to-debt swap inside the flash loan.
     /// @return collateralFreed The actual collateral freed.
     function _unwindCollateral(
         uint256 collateralToFree,
         uint256 flashLoanAmount,
-        bytes memory flashLoanSwapData
+        bytes memory collateralToDebtSwapData
     ) internal returns (uint256 collateralFreed) {
         LeveragedStrategyStorage storage S = _getLeveragedStrategyStorage();
 
@@ -640,18 +646,23 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
         uint256 collateralBefore = _getSelfBalance(S.collateralToken);
 
         if (flashLoanAmount > 0 && _getDebtAmount() > 0) {
-            // FL callback handles only debt repayment. Any unused collateral from the
-            // exactOut swap inside the FL is refunded to the strategy by the swapper.
+            // FL callback handles only debt repayment. If `exactOut` swap is available,
+            // any unused collateral from the exactOut swap inside the FL is refunded to the strategy by the swapper.
+            // In case of `exactIn` swap, the buffer for slippage is also swapped to debt.
+            // The entire collateral amount + slippage is consumed, and additional debt tokens remain in the strategy
+
+            // (bool isLeverageUp, bytes memory swapData): For unwinding, isLeverageUp is false, and swapData
+            // is the encoded bytes for swapping collateral to debt inside the `onFlashLoanReceived` callback.
+            bytes memory callbackData = abi.encode(false, collateralToDebtSwapData);
+
             _pendingFlashLoanAction = true;
-            S.flashLoanRouter.requestFlashLoan(
-                address(S.debtToken),
-                flashLoanAmount,
-                abi.encode(false, flashLoanSwapData)
-            );
+            S.flashLoanRouter.requestFlashLoan(address(S.debtToken), flashLoanAmount, callbackData);
         }
 
         // With exactOut, the `swapTo` during the FL may refund unused collateral.
         // Without exactOut, swapFrom consumes all collateral, skip accounting for refunded collateral.
+        // This step ensures that exact amount of collateral is withdrawn,
+        // after accounting for any potential refund from the swapper (only in case of `exactOut`)
         uint256 remainingToWithdraw = collateralToFree;
 
         if (S.isExactOutSwapEnabled) {
@@ -664,11 +675,13 @@ abstract contract LeveragedStrategy is CeresBaseVault, ILeveragedStrategy {
 
         if (remainingToWithdraw > 0) {
             uint256 toWithdraw = Math.min(remainingToWithdraw, _getCollateralAmount());
-            if (toWithdraw > 0) _withdrawCollateral(toWithdraw);
+            if (toWithdraw > 0) {
+                _withdrawCollateral(toWithdraw);
+            }
         }
 
-        // flRefund + toWithdraw can revert in _executeSwap (collateral->asset) if there is precision loss
-        // during withdrawal. We measure actual exact balance delta.
+        // `remainingToWithdraw` can revert in _executeSwap (collateral->asset) if there is precision loss
+        // during withdrawal (market specific). We measure actual exact balance delta.
         uint256 collateralFinal = _getSelfBalance(S.collateralToken);
         collateralFreed = collateralFinal > collateralBefore ? collateralFinal - collateralBefore : 0;
     }

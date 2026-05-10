@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {IEVC} from "../euler/IEVC.sol";
 import {IEVault} from "../euler/IEVault.sol";
@@ -10,8 +10,5 @@ interface ILeveragedEuler is ILeveragedStrategy {
     //                                    STATE VARIABLES                                        //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function getMarketDetails()
-        external
-        view
-        returns (address collateralVault, address borrowVault, address vaultConnector);
+    function getMarketDetails() external view returns (address collateralVault, address borrowVault);
 }

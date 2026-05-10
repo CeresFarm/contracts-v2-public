@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {LeveragedStrategyBaseSetup} from "./LeveragedStrategyBaseSetup.sol";
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
@@ -40,6 +40,12 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     //                                  SETUP VERIFICATION TESTS                                 //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
+    function test_StorageLocationInvariant() public pure virtual {
+        bytes32 storageLocation = keccak256(abi.encode(uint256(keccak256("ceres.storage.LeveragedStrategy")) - 1)) &
+            ~bytes32(uint256(0xff));
+        assertEq(uint256(storageLocation), uint256(0xdf5835635f9c63f5038c3c39a3e8c20793eb241995cc033746644d7d39feeb00));
+    }
+
     function test_InitialState() public view {
         assertTrue(address(0) != address(strategy), "Strategy should be deployed");
         assertEq(strategy.asset(), address(assetToken), "Asset mismatch");
@@ -68,7 +74,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         assertFalse(isExactOutSwapEnabled, "isExactOutSwapEnabled should be false");
 
         (uint128 depositLimit, uint128 redeemLimitShares, ) = strategy.getDepositWithdrawLimits();
-        (uint16 maxSlippageBps, uint16 performanceFeeBps, , , address performanceFeeRecipient_, ) = strategy
+        (uint16 maxSlippageBps, uint16 performanceFeeBps, , , address performanceFeeRecipient_, , ) = strategy
             .getConfig();
         assertEq(maxSlippageBps, MAX_SLIPPAGE_BPS, "maxSlippageBps mismatch");
         assertEq(depositLimit, DEPOSIT_LIMIT, "depositLimit mismatch");
@@ -388,6 +394,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         console.log("maxShares:", maxShares);
         console.log("claimable shares", strategy.claimableRedeemRequest(requestId1, user1));
 
+        vm.prank(user1);
         strategy.redeem(maxShares, user1, user1);
 
         uint256 requestId3 = _requestRedeemAs(liquidityProvider, shares3);
@@ -1028,7 +1035,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         // Set higher slippage on swapper to simulate insufficient debt tokens after swap
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (300, 1500, MAX_LOSS_BPS, feeReceiver))
+            abi.encodeCall(strategy.updateConfig, (300, 1500, MAX_LOSS_BPS, feeReceiver, uint32(1 days)))
         );
 
         swapper.setSlippage(310); // 3.1% slippage - will return less than expected
@@ -1296,10 +1303,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         _setupUserDeposit(user1, DEFAULT_DEPOSIT());
 
         // Set low slippage tolerance
-        (, uint16 performanceFeeBps, uint16 maxLossBps, , , ) = strategy.getConfig();
+        (, uint16 performanceFeeBps, uint16 maxLossBps, , , , ) = strategy.getConfig();
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (10, performanceFeeBps, maxLossBps, feeReceiver)) // 0.1%
+            abi.encodeCall(strategy.updateConfig, (10, performanceFeeBps, maxLossBps, feeReceiver, uint32(1 days))) // 0.1%
         );
 
         // Set high swapper slippage
@@ -1343,10 +1350,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         emit ICeresBaseVault.ConfigUpdated();
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (newSlippage, 1500, MAX_LOSS_BPS, feeReceiver))
+            abi.encodeCall(strategy.updateConfig, (newSlippage, 1500, MAX_LOSS_BPS, feeReceiver, uint32(1 days)))
         );
 
-        (uint16 maxSlippageBps, , , , , ) = strategy.getConfig();
+        (uint16 maxSlippageBps, , , , , , ) = strategy.getConfig();
         assertEq(maxSlippageBps, newSlippage, "Max slippage should be updated");
     }
 
@@ -1354,7 +1361,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     /// and that subsequent harvests do not mint fee shares while the recipient is unset.
     /// Also verifies that re-setting a non-zero recipient re-enables fee minting.
     function test_UpdateConfig_DisableFees_ViaZeroRecipient() public {
-        (uint16 maxSlippageBps, uint16 performanceFeeBps, uint16 maxLossBps, , address recipientBefore, ) = strategy
+        (uint16 maxSlippageBps, uint16 performanceFeeBps, uint16 maxLossBps, , address recipientBefore, , ) = strategy
             .getConfig();
         assertEq(recipientBefore, feeReceiver, "recipient is feeReceiver");
         assertGt(performanceFeeBps, 0, "fees enabled");
@@ -1362,10 +1369,13 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         // Step 1: clear the recipient via updateConfig(address(0)).
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, performanceFeeBps, maxLossBps, address(0)))
+            abi.encodeCall(
+                strategy.updateConfig,
+                (maxSlippageBps, performanceFeeBps, maxLossBps, address(0), uint32(1 days))
+            )
         );
 
-        (, , , , address recipientAfterClear, ) = strategy.getConfig();
+        (, , , , address recipientAfterClear, , ) = strategy.getConfig();
         assertEq(recipientAfterClear, address(0), "recipient should be zeroed");
 
         // Step 2: generate profit and harvest. No fee shares should be minted to the old recipient.
@@ -1389,7 +1399,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         // Step 3: re-enable by setting recipient back; subsequent profits should mint fee shares.
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, performanceFeeBps, maxLossBps, feeReceiver))
+            abi.encodeCall(
+                strategy.updateConfig,
+                (maxSlippageBps, performanceFeeBps, maxLossBps, feeReceiver, uint32(1 days))
+            )
         );
 
         assetToken.mint(address(strategy), toAirdrop);
@@ -1493,7 +1506,7 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         timelockHelper.runViaTimelockExpectRevert(
             timelock,
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (10001, 1500, MAX_LOSS_BPS, address(0))), // > 100%
+            abi.encodeCall(strategy.updateConfig, (10001, 1500, MAX_LOSS_BPS, address(0), uint32(1 days))), // > 100%
             management,
             LibError.InvalidValue.selector
         );
@@ -1530,13 +1543,21 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
     }
 
     function testRevert_RescueTokens_StrategyTokens() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(assetToken));
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.rescueTokens, (address(assetToken), 0, management)),
+            management,
+            LibError.InvalidToken.selector
+        );
 
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(debtToken));
+        timelockHelper.runViaTimelockExpectRevert(
+            timelock,
+            address(strategy),
+            abi.encodeCall(strategy.rescueTokens, (address(debtToken), 0, management)),
+            management,
+            LibError.InvalidToken.selector
+        );
     }
 
     function testRevert_Deposit_ExceedsLimit() public {
@@ -1558,10 +1579,10 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
 
         uint256 balanceBefore = randomToken.balanceOf(management);
 
-        vm.prank(management);
-        vm.expectEmit(true, true, true, true);
-        emit ILeveragedStrategy.TokensRecovered(address(randomToken), 1000 * 1e18);
-        strategy.executeOperation(4, 1000 * 1e18, address(randomToken));
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.rescueTokens, (address(randomToken), 1000 * 1e18, management))
+        );
 
         uint256 balanceAfter = randomToken.balanceOf(management);
         assertEq(balanceAfter - balanceBefore, 1000 * 1e18, "Should receive rescued tokens");
@@ -1639,11 +1660,15 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         _profitBps = uint16(bound(uint256(_profitBps), 10, BPS_PRECISION));
 
         // Set performance fee to 10%
-        (uint16 maxSlippageBps, , uint16 maxLossBps, , , ) = strategy.getConfig();
+        (uint16 maxSlippageBps, , uint16 maxLossBps, , , , ) = strategy.getConfig();
 
+        // Use profitUnlockPeriod=0 so the post-harvest `convertToShares` and the fee-share mint
+        // both denominate against the same `currentAssets`. With a non-zero unlock period the
+        // mint uses `currentAssets - performanceFees` while the test's expected-shares calc
+        // uses the buffered `totalAssets()`, producing a >0.1% mismatch.
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, 10_00, maxLossBps, feeReceiver))
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, 10_00, maxLossBps, feeReceiver, uint32(0)))
         );
 
         // Deposit into strategy
@@ -2053,5 +2078,154 @@ abstract contract LeveragedStrategyTest is LeveragedStrategyBaseSetup {
         uint256 finalLtv = _calculateLtv(strategy.getCollateralAmount(), strategy.getDebtAmount());
         assertGt(finalLtv, 5000, "LTV should increase after second rebalance");
         assertApproxEqRel(finalLtv, TARGET_LTV_BPS, 1e15, "LTV should be near target");
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    //                              PROFIT UNLOCK TESTS                                          //
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @dev Helper that re-runs `updateConfig` preserving every field except the unlock period.
+    /// Tests opt in to a non-zero `profitUnlockPeriod` without disturbing the strategy
+    /// default (which is 0 in test setups to observe profits immediately).
+    /// Note: `_runViaTimelock` advances time by `TIMELOCK_MIN_DELAY` (1 day) during the schedule
+    /// + execute cycle, so callers must account for this if they have already started a decay.
+    function _setProfitUnlockPeriod(uint32 period) internal {
+        (uint16 maxSlippageBps, uint16 performanceFeeBps, uint16 maxLossBps, , address recipient, , ) = strategy
+            .getConfig();
+        _runViaTimelock(
+            address(strategy),
+            abi.encodeCall(strategy.updateConfig, (maxSlippageBps, performanceFeeBps, maxLossBps, recipient, period))
+        );
+    }
+
+    /// @dev Drives a profit-bearing harvest cycle using protocol-specific interest accrual.
+    /// Returns the realized profit so tests can reason about decay arithmetic. Note that this
+    /// helper advances block.timestamp by 180 days via `_simulateInterestAccrual`.
+    function _harvestWithProfit() internal returns (uint256 profit) {
+        _simulateInterestAccrual(1500, 300, 180 days);
+        vm.prank(keeper);
+        uint256 loss;
+        (profit, loss) = strategy.harvestAndReport();
+        require(profit > 0, "test setup: expected profit");
+        require(loss == 0, "test setup: expected no loss");
+    }
+
+    /// @notice The full profit buffer is locked at the moment of the report. With period > 0
+    /// the freshly reported profit is invisible to `totalAssets()` until any decay has elapsed.
+    function test_ProfitUnlock_AtT0_FullyLocked() public {
+        _setupInitialLeveragePosition(DEFAULT_DEPOSIT());
+        _setProfitUnlockPeriod(uint32(1 days));
+
+        uint256 totalAssetsBefore = strategy.totalAssets();
+        uint256 profit = _harvestWithProfit();
+
+        (uint128 lockedProfit, , uint32 period, uint256 currentlyLocked) = strategy.getProfitUnlockState();
+        assertEq(period, 1 days, "period mismatch");
+        assertGt(lockedProfit, 0, "lockedProfit should be set");
+        assertEq(currentlyLocked, lockedProfit, "no decay should have occurred at T+0");
+        assertApproxEqAbs(
+            strategy.totalAssets(),
+            totalAssetsBefore + (profit - uint256(lockedProfit)),
+            1,
+            "totalAssets must equal realized minus locked at T+0"
+        );
+        // The locked buffer is the net-of-fee profit; it cannot exceed the gross profit.
+        assertLe(uint256(lockedProfit), profit, "lockedProfit must be net-of-fee <= profit");
+    }
+
+    /// @notice Locked profit decays linearly to zero across the unlock period and `lastProfitReport`
+    /// remains pinned at the harvest block (anchor is only moved by `_updateLockedProfit`).
+    function test_ProfitUnlock_LinearDecay() public {
+        _setupInitialLeveragePosition(DEFAULT_DEPOSIT());
+        _setProfitUnlockPeriod(uint32(1 days));
+
+        uint256 totalAssetsBefore = strategy.totalAssets();
+        uint256 profit = _harvestWithProfit();
+        (uint128 lockedProfit, uint40 lastReport, uint32 period, ) = strategy.getProfitUnlockState();
+
+        // Quarter-period elapsed.
+        skip(period / 4);
+        uint256 expectedQuarter = (uint256(lockedProfit) * (period - period / 4)) / period;
+        (, , , uint256 lockedQuarter) = strategy.getProfitUnlockState();
+        assertApproxEqAbs(lockedQuarter, expectedQuarter, 1, "quarter-period decay mismatch");
+        assertApproxEqAbs(
+            strategy.totalAssets(),
+            totalAssetsBefore + (profit - expectedQuarter),
+            1,
+            "totalAssets at T+P/4 mismatch"
+        );
+
+        // Half-period elapsed (skip the second quarter).
+        skip(period / 4);
+        uint256 expectedHalf = uint256(lockedProfit) / 2;
+        (, , , uint256 lockedHalf) = strategy.getProfitUnlockState();
+        assertApproxEqAbs(lockedHalf, expectedHalf, 1, "half-period decay mismatch");
+
+        // Past the full period: no profit should remain locked.
+        skip(period);
+        (, , , uint256 lockedAfter) = strategy.getProfitUnlockState();
+        assertEq(lockedAfter, 0, "buffer must be fully unlocked after period");
+        assertApproxEqAbs(
+            strategy.totalAssets(),
+            totalAssetsBefore + profit,
+            1,
+            "totalAssets must equal realized after full unlock"
+        );
+
+        // Anchor unchanged across the whole decay.
+        (, uint40 lastReportAfter, , ) = strategy.getProfitUnlockState();
+        assertEq(lastReportAfter, lastReport, "lastProfitReport must not move during decay");
+    }
+
+    /// @notice Reducing `profitUnlockPeriod` instantly releases the existing buffer. Use a
+    /// 7-day period here so the buffer is still substantially locked when the (1-day) timelock
+    /// schedule + execute completes; the shrink path then has something to release.
+    function test_ProfitUnlock_PeriodShrink_InstantRelease() public {
+        _setupInitialLeveragePosition(DEFAULT_DEPOSIT());
+        _setProfitUnlockPeriod(uint32(7 days));
+
+        uint256 totalAssetsAtRealized = strategy.totalAssets();
+        uint256 profit = _harvestWithProfit();
+        (uint128 lockedBefore, , , ) = strategy.getProfitUnlockState();
+        assertGt(lockedBefore, 0, "buffer prerequisite");
+
+        // Shrink the period to 0. _runViaTimelock advances 1 day; with period=7d the buffer is
+        // still ~6/7 locked at execute time. The shrink branch fires and zeroes lockedProfit.
+        _setProfitUnlockPeriod(uint32(0));
+
+        (uint128 lockedAfter, , uint32 periodAfter, uint256 currentlyLocked) = strategy.getProfitUnlockState();
+        assertEq(periodAfter, 0, "period not updated");
+        // lockedAfter isn't 0 because CeresBaseVault just updates to the remainder and sets period=0 (which zeroes currentlyLocked)
+        assertEq(currentlyLocked, 0, "currentlyLocked must be zero post-release");
+        // Realized total should now be visible: greater than the pre-harvest realized value.
+        assertGt(strategy.totalAssets(), totalAssetsAtRealized, "released buffer must surface in totalAssets");
+    }
+
+    /// @notice Increasing `profitUnlockPeriod` updates the buffer to the currently locked amount
+    /// and resets the anchor to the current block, decaying the remaining buffer over the new schedule.
+    function test_ProfitUnlock_PeriodIncrease_NoRelease() public {
+        _setupInitialLeveragePosition(DEFAULT_DEPOSIT());
+        _setProfitUnlockPeriod(uint32(7 days));
+
+        _harvestWithProfit();
+        (uint128 lockedBefore, uint40 anchorBefore, , ) = strategy.getProfitUnlockState();
+        assertGt(lockedBefore, 0, "buffer prerequisite");
+
+        _setProfitUnlockPeriod(uint32(MAX_PROFIT_UNLOCK_PERIOD()));
+
+        (uint128 lockedAfter, uint40 anchorAfter, uint32 periodAfter, uint256 currentlyLocked) = strategy
+            .getProfitUnlockState();
+        assertEq(periodAfter, uint32(MAX_PROFIT_UNLOCK_PERIOD()), "period not updated");
+        // The buffer settles during the update: it drops from the 1-day timelock decay, but remains partially locked.
+        assertLt(lockedAfter, lockedBefore, "buffer must settle and drop on period change");
+        assertGt(lockedAfter, 0, "buffer must not be fully released on period increase");
+        assertGt(anchorAfter, anchorBefore, "anchor must update to execution block");
+        assertEq(currentlyLocked, lockedAfter, "currentlyLocked must equal the newly settled buffer at T+0");
+    }
+
+    /// @dev Mirror of the contract constant; declared in the test layer because the constant is
+    /// `internal` on `CeresBaseVault` and not exposed via the interface.
+    function MAX_PROFIT_UNLOCK_PERIOD() internal pure returns (uint256) {
+        return 30 days;
     }
 }

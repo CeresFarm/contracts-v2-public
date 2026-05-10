@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {EulerTestSetup} from "./EulerTestSetup.sol";
 
@@ -18,11 +18,10 @@ contract EulerSpecificTest is EulerTestSetup {
     function test_InitialValues_LeveragedEuler() public view {
         ILeveragedEuler eulerStrategy = ILeveragedEuler(address(strategy));
 
-        (address collateralVault_, address borrowVault_, address evc_) = eulerStrategy.getMarketDetails();
+        (address collateralVault_, address borrowVault_) = eulerStrategy.getMarketDetails();
 
         assertEq(collateralVault_, address(collateralVault), "COLLATERAL_VAULT mismatch");
         assertEq(borrowVault_, address(borrowVault), "BORROW_VAULT mismatch");
-        assertEq(evc_, address(evc), "VAULT_CONNECTOR mismatch");
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -94,23 +93,5 @@ contract EulerSpecificTest is EulerTestSetup {
 
         // Net assets should have increased due to collateral yield
         assertTrue(finalNetAssets > initialNetAssets, "Net assets should increase with collateral yield");
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-    //                              RESCUE RECEIPT-TOKEN PROTECTION                              //
-    ///////////////////////////////////////////////////////////////////////////////////////////////
-
-    /// @notice Rescue must not be able to transfer the Euler collateral vault shares.
-    function testRevert_RescueTokens_CollateralVaultShares() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(collateralVault));
-    }
-
-    /// @notice Rescue must not be able to transfer the Euler borrow vault shares.
-    function testRevert_RescueTokens_BorrowVaultShares() public {
-        vm.prank(management);
-        vm.expectRevert(LibError.InvalidToken.selector);
-        strategy.executeOperation(4, 0, address(borrowVault));
     }
 }

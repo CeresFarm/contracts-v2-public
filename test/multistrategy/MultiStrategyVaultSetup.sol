@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
@@ -8,6 +8,8 @@ import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {MultiStrategyVault} from "src/strategies/MultiStrategyVault.sol";
 import {IMultiStrategyVault} from "src/interfaces/strategies/IMultiStrategyVault.sol";
 import {ICeresBaseVault} from "src/interfaces/strategies/ICeresBaseVault.sol";
+import {ILeveragedStrategy} from "src/interfaces/strategies/ILeveragedStrategy.sol";
+
 import {RoleManager} from "src/periphery/RoleManager.sol";
 
 import {MockERC20} from "../mock/common/MockERC20.sol";
@@ -96,6 +98,12 @@ abstract contract MultiStrategyVaultSetup is Test {
         vm.startPrank(management);
         childA.setDepositWithdrawLimits(DEPOSIT_LIMIT, REDEEM_LIMIT, 0);
         childB.setDepositWithdrawLimits(DEPOSIT_LIMIT, REDEEM_LIMIT, 0);
+        // Disable the linear profit-unlock buffer on the child strategies so that yield is
+        // visible immediately to the parent vault's `IERC4626(child).convertToAssets(...)`
+        // reads. With the default `profitUnlockPeriod = 1 days` the child's `totalAssets()`
+        // would hide harvested yield until decayed, breaking the MSV report-strategy tests.
+        childA.updateConfig(0, 0, 0, address(0), uint32(0));
+        childB.updateConfig(0, 0, 0, address(0), uint32(0));
         vm.stopPrank();
 
         // Deploy MultiStrategyVault
@@ -112,6 +120,9 @@ abstract contract MultiStrategyVaultSetup is Test {
         // Configure vault limits
         vm.startPrank(management);
         vault.setDepositWithdrawLimits(DEPOSIT_LIMIT, REDEEM_LIMIT, 0);
+        // Disable profit-unlock buffer on the vault so that reportStrategy immediately
+        // updates totalAssets() (same reasoning as for child strategies above).
+        vault.updateConfig(0, 0, 0, address(0), uint32(0));
 
         // Register child strategies and set allocation caps
         vault.addStrategy(address(childA));
@@ -160,8 +171,9 @@ abstract contract MultiStrategyVaultSetup is Test {
     }
 
     function _claimDeallocatedFromChild(address child) internal returns (uint256 assets) {
+        uint256 claimableShares = ILeveragedStrategy(child).claimableRedeemRequest(address(vault));
         vm.prank(curator);
-        assets = vault.claimDeallocated(child);
+        assets = vault.claimDeallocated(child, claimableShares);
     }
 
     /// @dev Processes the child strategy's current request so claimDeallocated can be called.

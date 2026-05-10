@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20Metadata} from "@openzeppelin-contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {Math} from "@openzeppelin-contracts/utils/math/Math.sol";
@@ -74,7 +74,9 @@ contract OracleAdapter is IOracleAdapter {
         // for low-decimal tokens. The factor cancels out in the final mulDiv.
         uint256 scaledRefAmount = COLLATERAL_UNIT * INTERNAL_SCALE_FACTOR;
         uint256 scaledCollateralInAsset = ROUTER.quote(COLLATERAL_TOKEN, ASSET_TOKEN, scaledRefAmount);
-        return assetAmount.mulDiv(scaledRefAmount, scaledCollateralInAsset);
+        uint256 outAmount = assetAmount.mulDiv(scaledRefAmount, scaledCollateralInAsset);
+        if (outAmount == 0) revert LibError.ZeroOutputAmount();
+        return outAmount;
     }
 
     /// @notice Converts collateral token amount to debt token amount.
@@ -94,7 +96,9 @@ contract OracleAdapter is IOracleAdapter {
         // Same scaled-inverse approach as convertAssetsToCollateral.
         uint256 scaledRefAmount = COLLATERAL_UNIT * INTERNAL_SCALE_FACTOR;
         uint256 scaledCollateralInDebt = ROUTER.quote(COLLATERAL_TOKEN, DEBT_TOKEN, scaledRefAmount);
-        return debtAmount.mulDiv(scaledRefAmount, scaledCollateralInDebt);
+        uint256 outAmount = debtAmount.mulDiv(scaledRefAmount, scaledCollateralInDebt);
+        if (outAmount == 0) revert LibError.ZeroOutputAmount();
+        return outAmount;
     }
 
     /// @notice Converts debt token amount to asset token amount via collateral as an intermediate.
