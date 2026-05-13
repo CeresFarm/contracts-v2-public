@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {ICeresBaseVault} from "./ICeresBaseVault.sol";
 
@@ -25,10 +25,9 @@ interface IMultiStrategyVault is ICeresBaseVault {
     event FundsAllocated(address indexed strategy, uint256 assets, uint256 sharesReceived);
     event DeallocateRequested(address indexed strategy, uint256 shares, uint256 requestId);
     event FundsClaimed(address indexed strategy, uint256 assets, uint256 sharesBurned);
-    event StrategyReportedFromVault(address indexed strategy, uint256 previousDebt, uint256 newDebt);
+    event StrategyReportedFromVault(address indexed strategy, uint256 previousAllocated, uint256 currentAllocated);
     event SupplyQueueUpdated(address[] newQueue);
     event WithdrawQueueUpdated(address[] newQueue);
-    event VaultReported(uint256 prevTotalAssets, uint256 newTotalAssets);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                    VIEW FUNCTIONS                                         //
@@ -55,7 +54,7 @@ interface IMultiStrategyVault is ICeresBaseVault {
 
     function allocate(address strategy, uint256 assets) external;
     function requestDeallocate(address strategy, uint256 shares) external returns (uint256 requestId);
-    function claimDeallocated(address strategy) external returns (uint256 assets);
+    function claimDeallocated(address strategy, uint256 shares) external returns (uint256 assets);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                          REPORTING (KEEPER_ROLE)                                          //

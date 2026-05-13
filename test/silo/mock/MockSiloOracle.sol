@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {ISiloOracle} from "src/interfaces/silo/ISiloOracle.sol";
 import {ERC20} from "@openzeppelin-contracts/token/ERC20/ERC20.sol";
@@ -26,7 +26,7 @@ contract MockSiloOracle is ISiloOracle {
     }
 
     function beforeQuote(address) external view {
-        if (shouldRevert)  revert LibError.OracleError();
+        if (shouldRevert) revert LibError.OracleError();
     }
 
     function quote(uint256 _baseAmount, address _baseToken) external view returns (uint256) {

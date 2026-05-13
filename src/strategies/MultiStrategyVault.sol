@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC4626} from "@openzeppelin-contracts/interfaces/IERC4626.sol";
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
@@ -38,7 +38,7 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.MultiStrategyVault")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant MULTISTRATEGY_VAULT_STORAGE_LOCATION =
-        0xd0fc71029693d2e5d27a08388d9c52d671f6d91a9ba9e98184bcdba03ec48800;
+        0xec419cbfd5c3ba05e0e140d724d3979ed64708595283fbb576f70849e3c9b300;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                         STATE                                             //
@@ -276,26 +276,25 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
     /// @dev Calls redeem() on the child strategy. Updates debt accounting based on
     ///      the actual assets received.
     /// @param strategy Address of the child strategy.
-    /// @return assets Amount of underlying assets received.
-    function claimDeallocated(address strategy) external nonReentrant onlyRole(CURATOR_ROLE) returns (uint256 assets) {
+    /// @param shares Number of strategy shares to redeem. Curator should get this amount off-chain
+    ///               by calling `claimableShares` on the child strategy after the redeem request is processed.
+    /// @return assetsClaimed Amount of underlying assets received.
+    function claimDeallocated(
+        address strategy,
+        uint256 shares
+    ) external nonReentrant onlyRole(CURATOR_ROLE) returns (uint256 assetsClaimed) {
         MultiStrategyVaultStorage storage S = _getMultiStrategyVaultStorage();
         StrategyConfig storage config = S.strategyConfig[strategy];
         if (config.activatedAt == 0) revert LibError.StrategyNotActive();
+        if (shares == 0) revert LibError.ZeroShares();
 
-        // Check how many shares are claimable
-        ICeresBaseVault.UserRedeemRequest memory userRequest = ICeresBaseVault(strategy).userRedeemRequests(
-            address(this)
-        );
-        if (userRequest.shares == 0) revert LibError.ZeroShares();
-
-        // Redeem all claimable shares
-        uint256 sharesToRedeem = userRequest.shares;
-        assets = IERC4626(strategy).redeem(sharesToRedeem, address(this), address(this));
+        // The child strategy enforces that `shares <= claimableShares` and reverts otherwise
+        assetsClaimed = IERC4626(strategy).redeem(shares, address(this), address(this));
 
         // Update allocation accounting using cuurent valuation
         _reportStrategy(strategy);
 
-        emit FundsClaimed(strategy, assets, sharesToRedeem);
+        emit FundsClaimed(strategy, assetsClaimed, shares);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -353,7 +352,7 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
             S.totalAllocated -= loss;
         }
 
-        _refreshTotalAssets();
+        _processReport();
         emit StrategyReportedFromVault(strategy, previousAllocated, actualValue);
     }
 
@@ -388,37 +387,19 @@ contract MultiStrategyVault is CeresBaseVault, IMultiStrategyVault {
         if (toAllocate == 0) return;
 
         IERC20(asset()).forceApprove(strategy, toAllocate);
-        IERC4626(strategy).deposit(toAllocate, address(this));
+        uint256 sharesReceived = IERC4626(strategy).deposit(toAllocate, address(this));
 
         config.currentAllocated = (currentAllocated + toAllocate).toUint128();
         S.totalAllocated += toAllocate;
 
-        emit FundsAllocated(strategy, toAllocate, 0);
+        emit FundsAllocated(strategy, toAllocate, sharesReceived);
     }
 
-    /// @dev Cannot implement instant free funds from async strategies. Returns 0.
+    /// @dev Cannot implement instant free funds from async strategies. No-op.
     /// The keeper must have already claimed funds from child strategies before
-    /// calling processCurrentRequest.
-    function _freeFunds(
-        uint256 /* amountToFree */,
-        bytes calldata /* extraData */
-    ) internal pure override returns (uint256) {
-        return 0;
-    }
-
-    /// @dev Called by processCurrentRequest before processing a request.
-    ///      Refreshes totalAssets without charging performance fees.
-    function _onProcessRequest(bytes calldata /* extraData */) internal virtual override {
-        _refreshTotalAssets();
-    }
-
-    /// @dev MultiStrategyVault does not charge performance fees.
-    /// Overrides _harvestAndReport to skip profit/loss tracking and fee storage writes.
-    function _harvestAndReport() internal override returns (uint256 /* profit */, uint256 /* loss */) {
-        (uint256 prevAssets, uint256 currentAssets) = _refreshTotalAssets();
-        emit VaultReported(prevAssets, currentAssets);
-        return (0, 0);
-    }
+    /// calling processCurrentRequest. Top-down accounting in `processCurrentRequest`
+    /// observes zero balance/asset deltas and proceeds with `availableAssets` only.
+    function _freeFunds(uint256 /* amountToFree */, bytes calldata /* extraData */) internal pure override {}
 
     /// @dev MultiStrategyVault does not charge performance fees.
     function _chargeFees(uint256 /* profit */, uint256 /* totalAssets */) internal pure override returns (uint256) {

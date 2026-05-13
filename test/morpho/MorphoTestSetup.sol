@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {LeveragedStrategyBaseSetup} from "test/common/LeveragedStrategyBaseSetup.sol";
 import {console} from "forge-std/Test.sol";
@@ -216,7 +216,7 @@ contract MorphoTestSetup is LeveragedStrategyBaseSetup {
         _runViaTimelock(address(strategy), abi.encodeCall(strategy.setFlashLoanRouter, (address(flashLoanRouter))));
         _runViaTimelock(
             address(strategy),
-            abi.encodeCall(strategy.updateConfig, (MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver))
+            abi.encodeCall(strategy.updateConfig, (MAX_SLIPPAGE_BPS, 1500, MAX_LOSS_BPS, feeReceiver, uint32(0)))
         );
 
         // Instant setters (MANAGEMENT_ROLE).

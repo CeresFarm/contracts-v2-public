@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {ILeveragedStrategy} from "./ILeveragedStrategy.sol";
 
@@ -14,7 +14,7 @@ interface ILeveragedAave is ILeveragedStrategy {
     //                                    VIEW FUNCTIONS                                         //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function getMarketDetails() external view returns (address aavePoolAddressesProvider, address aavePool);
+    function getMarketDetails() external view returns (address aavePool);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                   ADMIN FUNCTIONS                                         //

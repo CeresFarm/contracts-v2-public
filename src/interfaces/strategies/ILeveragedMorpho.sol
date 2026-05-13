@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {MarketParams} from "morpho-blue/interfaces/IMorpho.sol";
 import {ILeveragedStrategy} from "./ILeveragedStrategy.sol";

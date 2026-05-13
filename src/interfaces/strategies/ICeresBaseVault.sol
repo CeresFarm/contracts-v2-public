@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {IERC4626} from "@openzeppelin-contracts/interfaces/IERC4626.sol";
 
@@ -17,7 +17,8 @@ interface ICeresBaseVault is IERC4626 {
     );
 
     event RequestProcessed(uint256 indexed requestId, uint256 totalShares, uint256 pricePerShare);
-    event StrategyReported(address indexed keeper, uint256 profit, uint256 loss, uint256 performanceFees);
+    event Reported(address indexed keeper, uint256 profit, uint256 loss, uint256 performanceFees);
+    event ProfitLocked(uint256 lockedAmount);
 
     event ConfigUpdated();
 
@@ -63,8 +64,14 @@ interface ICeresBaseVault is IERC4626 {
             uint16 maxLossBps,
             uint48 lastReportTimestamp,
             address performanceFeeRecipient,
-            address roleManager
+            address roleManager,
+            uint32 profitUnlockPeriod
         );
+
+    function getProfitUnlockState()
+        external
+        view
+        returns (uint128 lockedProfit, uint40 lastProfitReport, uint32 profitUnlockPeriod, uint256 currentlyLocked);
 
     function getStats() external view returns (int128 cumulativeNetProfit, int128 snapshotNetProfit);
 
@@ -99,7 +106,8 @@ interface ICeresBaseVault is IERC4626 {
         uint16 _maxSlippageBps,
         uint16 _performanceFeeBps,
         uint16 _maxLossBps,
-        address _performanceFeeRecipient
+        address _performanceFeeRecipient,
+        uint32 _profitUnlockPeriod
     ) external;
 
     function setDepositWithdrawLimits(uint128 _depositLimit, uint128 _redeemLimit, uint96 _minDepositAmount) external;

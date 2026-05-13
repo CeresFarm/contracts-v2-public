@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IUniversalOracleRouter} from "../interfaces/periphery/IUniversalOracleRouter.sol";
 import {IOracleRoute} from "../interfaces/periphery/IOracleRoute.sol";
@@ -54,7 +54,7 @@ contract UniversalOracleRouter is IUniversalOracleRouter {
         uint256 currentAmount = amountIn;
         address currentToken = tokenIn;
 
-        for (uint256 i = 0; i < path.length; i++) {
+        for (uint256 i = 0; i < path.length; ++i) {
             RouteStep memory step = path[i];
 
             // Query the specific OracleRoute for this hop
@@ -98,7 +98,7 @@ contract UniversalOracleRouter is IUniversalOracleRouter {
     function _validatePath(address tokenOut, RouteStep[] memory path) internal pure {
         if (path.length == 0) revert LibError.InvalidOracleRoute();
         if (path[path.length - 1].targetToken != tokenOut) revert LibError.InvalidToken();
-        for (uint256 i = 0; i < path.length; i++) {
+        for (uint256 i = 0; i < path.length; ++i) {
             if (path[i].oracleRoute == address(0)) revert LibError.InvalidOracleRoute();
             if (path[i].targetToken == address(0)) revert LibError.InvalidOracleRoute();
         }
@@ -107,7 +107,7 @@ contract UniversalOracleRouter is IUniversalOracleRouter {
     /// @dev Clears any existing route for the pair and writes the new one.
     function _writeRoute(address tokenIn, address tokenOut, RouteStep[] memory path) internal {
         delete _routes[tokenIn][tokenOut];
-        for (uint256 i = 0; i < path.length; i++) {
+        for (uint256 i = 0; i < path.length; ++i) {
             _routes[tokenIn][tokenOut].push(path[i]);
         }
     }

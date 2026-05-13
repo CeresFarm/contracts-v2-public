@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: UNLICENSED
 /// Source: https://github.com/euler-xyz/euler-price-oracle/blob/master/src/interfaces/IPriceOracle.sol
-pragma solidity 0.8.28;
+pragma solidity ^0.8.0;
 
 /// @title IEulerOracle
 /// @custom:security-contact security@euler.xyz

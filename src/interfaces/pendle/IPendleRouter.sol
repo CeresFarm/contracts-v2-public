@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 /// @title IPendleRouter
 /// @notice Minimal interface for Pendle Router V4 swap functions used by CeresSwapper.

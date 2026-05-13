@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 
@@ -72,9 +72,7 @@ contract MinimalCeresStrategy is LeveragedStrategy {
         return total > reserve ? total - reserve : 0;
     }
 
-    /// @dev No leverage to unwind. Returns 0 so processCurrentRequest falls back
+    /// @dev No leverage to unwind. No-op so processCurrentRequest falls back
     /// to idle-asset coverage only
-    function _freeFunds(uint256, bytes calldata) internal pure override returns (uint256) {
-        return 0;
-    }
+    function _freeFunds(uint256, bytes calldata) internal pure override {}
 }

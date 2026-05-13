@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
@@ -25,7 +25,6 @@ contract LeveragedEuler is LeveragedStrategy {
     struct LeveragedEulerStorage {
         IEVault collateralVault;
         IEVault borrowVault;
-        IEVC vaultConnector;
     }
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.LeveragedEuler")) - 1)) & ~bytes32(uint256(0xff))
@@ -88,10 +87,8 @@ contract LeveragedEuler is LeveragedStrategy {
         S.collateralVault = IEVault(_collateralVault);
         S.borrowVault = IEVault(_borrowVault);
 
-        S.vaultConnector = IEVC(_vaultConnector);
-
-        S.vaultConnector.enableCollateral(address(this), _collateralVault);
-        S.vaultConnector.enableController(address(this), _borrowVault);
+        IEVC(_vaultConnector).enableCollateral(address(this), _collateralVault);
+        IEVC(_vaultConnector).enableController(address(this), _borrowVault);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -99,15 +96,10 @@ contract LeveragedEuler is LeveragedStrategy {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice Returns the Euler vault addresses used by the strategy.
-    function getMarketDetails()
-        external
-        view
-        returns (address collateralVault, address borrowVault, address vaultConnector)
-    {
+    function getMarketDetails() external view returns (address collateralVault, address borrowVault) {
         LeveragedEulerStorage storage S = _getLeveragedEulerStorage();
         collateralVault = address(S.collateralVault);
         borrowVault = address(S.borrowVault);
-        vaultConnector = address(S.vaultConnector);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -167,7 +159,8 @@ contract LeveragedEuler is LeveragedStrategy {
 
         // collateralValue returned by Euler is risk adjusted value
         // hence to calculate actual collateral value, divide by collateralization ratio (LTV) of collateral
-        uint256 actualCollateralValue = collateralValue.mulDiv(BPS_PRECISION, _getMaxLtv(), Math.Rounding.Floor);
+        uint256 maxLtv = Math.max(1, _getMaxLtv()); // Avoid division by zero if collateral is disabled
+        uint256 actualCollateralValue = collateralValue.mulDiv(BPS_PRECISION, maxLtv, Math.Rounding.Floor);
 
         // Round-up the strategy LTV to be on the conservative side
         ltvBps = (liabilityValue.mulDiv(BPS_PRECISION, actualCollateralValue, Math.Rounding.Ceil)).toUint16();
@@ -183,14 +176,5 @@ contract LeveragedEuler is LeveragedStrategy {
     /// @dev Returns the market max LTV in basis points.
     function _getStrategyMaxLtvBps() internal view override returns (uint16 maxLtvBps) {
         maxLtvBps = _getMaxLtv().toUint16();
-    }
-
-    /// @dev Rejects rescue of Euler vault share tokens (collateralVault / borrowVault). Both are
-    /// ERC4626-style transferable shares that represent the strategy's deposit and borrow positions
-    function _validateRescueToken(address _token) internal view override {
-        LeveragedEulerStorage storage S = _getLeveragedEulerStorage();
-        if (_token == address(S.collateralVault) || _token == address(S.borrowVault)) {
-            revert LibError.InvalidToken();
-        }
     }
 }

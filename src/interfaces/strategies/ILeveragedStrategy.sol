@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.28;
+pragma solidity ^0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 
@@ -14,7 +14,7 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                                         EVENTS                                            //
     ///////////////////////////////////////////////////////////////////////////////////////////////
-    event TokensRecovered(address indexed token, uint256 amount);
+    event TokensRecovered(address indexed token, uint256 amount, address indexed to);
     event SwapDepositCollateral(uint256 assetAmount, uint256 collateralReceived);
     event Rebalance(address indexed keeper, uint256 debtAmount, bool isLeverageUp, bool useFlashLoan);
     event MarketOperationExecuted(uint8 operationType, uint256 amount);
@@ -22,10 +22,10 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
 
     // Config events
     event TargetLtvUpdated(uint16 newTargetLtv, uint16 newLtvBuffer);
-    event OracleAdapterUpdated(address indexed oldAddress, address indexed newAddress);
-    event SwapperUpdated(address indexed oldAddress, address indexed newAddress);
-    event FlashLoanRouterUpdated(address indexed oldAddress, address indexed newAddress);
-    event KeeperDelayUpdated(uint48 oldDelay, uint48 newDelay);
+    event OracleAdapterUpdated(address indexed newAddress);
+    event SwapperUpdated(address indexed newAddress);
+    event FlashLoanRouterUpdated(address indexed newAddress);
+    event KeeperDelayUpdated(uint48 newDelay);
     event SetExactOutSwapEnabled(bool enabled);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -96,7 +96,7 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
     //                                   ADMIN FUNCTIONS                                         //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    function executeOperation(uint8 operationType, uint256 amount, address token) external;
+    function executeOperation(uint8 operationType, uint256 amount) external;
 
     function executeSwapOperation(
         IERC20 tokenIn,
@@ -116,4 +116,5 @@ interface ILeveragedStrategy is ICeresBaseVault, IFlashLoanReceiver {
     function setSwapper(address _swapper) external;
     function setFlashLoanRouter(address _flashLoanRouter) external;
     function setKeeperDelay(uint48 _keeperDelay) external;
+    function rescueTokens(address _token, uint256 _amount, address _to) external;
 }

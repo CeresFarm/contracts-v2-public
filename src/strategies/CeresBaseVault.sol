@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/ERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -21,8 +21,6 @@ import {ICeresBaseVault} from "../interfaces/strategies/ICeresBaseVault.sol";
 /// @notice Base contract for all Ceres vaults and strategies supporting synchronous deposits and asynchronous withdrawals
 /// inspired by ERC-7540 standard (does not implement all functions from the standard)
 /// @dev The contract deliberately does not implement the `operator` logic from the standard
-/// as the same can be achieved through ERC20 approval mechanism.
-/// The process to claim redeem requests is permissionless once the request is processed.
 abstract contract CeresBaseVault is
     Initializable,
     ERC20Upgradeable,
@@ -40,10 +38,12 @@ abstract contract CeresBaseVault is
     // Constants
     uint16 internal constant BPS_PRECISION = 100_00; // 100% in basis points
     uint16 internal constant MAX_FEE = 50_00; // 50% in basis points
+    uint32 internal constant MAX_PROFIT_UNLOCK_PERIOD = 30 days;
 
     bytes32 internal constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
     bytes32 internal constant MANAGEMENT_ROLE = keccak256("MANAGEMENT_ROLE");
     bytes32 internal constant TIMELOCKED_ADMIN_ROLE = keccak256("TIMELOCKED_ADMIN_ROLE");
+    bytes32 internal constant EMERGENCY_ADMIN_ROLE = keccak256("EMERGENCY_ADMIN_ROLE");
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.CeresBaseVault")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant CERES_BASE_VAULT_STORAGE_LOCATION =
@@ -73,8 +73,10 @@ abstract contract CeresBaseVault is
         uint16 maxLossBps;
 
         // Slot 3: 256 bits
-        // Store totalAssets (instead of erc20 balanceOf) to prevent price per share manipulation through airdrops
-        uint256 totalAssets;
+        // Store realizedAssets (instead of real-time erc20 balanceOf)
+        // Represents the raw, last-reported asset value of the vault. The user-visible totalAssets() view
+        // subtracts any still-locked profit from this baseline
+        uint256 realizedAssets;
 
         // Slot 4: 128 + 128 = 256 bits
         // Assets reserved within the strategy to cover outstanding processed withdrawals.
@@ -99,6 +101,14 @@ abstract contract CeresBaseVault is
 
         // Slot 8: 160 bits (96 bits free for future expansion)
         address performanceFeeRecipient;
+
+        // Slot 9: 128 + 40 + 32 = 200 bits (56 bits free for future expansion)
+        // Linear profit unlock buffer (Yearn V2 style). Reported profit (net of performance fees)
+        // is added to lockedProfit and decays linearly over profitUnlockPeriod, prevents against
+        // Just-In-Time (JIT) deposit-redeem extraction of yield.
+        uint128 lockedProfit;
+        uint40 lastProfitReport;
+        uint32 profitUnlockPeriod;
     }
 
     function _getCeresBaseVaultStorage() private pure returns (CeresBaseVaultStorage storage S) {
@@ -158,6 +168,7 @@ abstract contract CeresBaseVault is
 
         S.currentRequestId = 1; // Start requestIds with 1
         S.lastReportTimestamp = uint40(block.timestamp);
+        S.profitUnlockPeriod = uint32(1 days);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -178,11 +189,16 @@ abstract contract CeresBaseVault is
         return address(_getCeresBaseVaultStorage().asset);
     }
 
-    /// @notice Returns the total assets tracked by the vault.
-    /// @dev Stored explicitly using internal accounting
-    /// @return Total assets tracked by the vault.
+    /// @notice Returns the total assets tracked by the vault, net of any still-locked profit buffer.
+    /// @dev Returns `realizedAssets - currentlyLockedProfit`. The locked profit decays linearly to zero
+    /// over `profitUnlockPeriod`, smoothing yield into price-per-share and defending against JIT
+    /// deposit-redeem extraction of harvested yield.
+    /// @return Total assets attributable to share holders at the current block.
     function totalAssets() public view virtual returns (uint256) {
-        return _getCeresBaseVaultStorage().totalAssets;
+        // Invariant maintained by _updateLockedProfit: realizedAssets >= _calculateLockedProfit().
+        // Relying on checked arithmetic ensures any future refactor that breaks this invariant
+        // surfaces immediately as a revert rather than silently corrupting price-per-share.
+        return _getCeresBaseVaultStorage().realizedAssets - _calculateLockedProfit();
     }
 
     /// @notice Converts an asset amount to vault shares using the current price, rounding down.
@@ -200,16 +216,20 @@ abstract contract CeresBaseVault is
     }
 
     /// @notice Returns the maximum assets that can be deposited for the given receiver.
-    /// @dev Bounded by the deposit limit minus current total assets.
+    /// @dev Bounded by the deposit limit minus current realized assets.
+    /// Reads `realizedAssets` directly (NOT the unlocked `totalAssets()` view) so that the
+    /// configured `depositLimit` enforces a cap on the vault's actual holdings. Using the
+    /// unlocked view would let depositors mint over the cap during a profit-unlock window
+    /// because the view temporarily understates holdings by the still-locked amount.
     /// param receiver The address receiving the shares (ignored in calculation).
     /// @return Maximum assets that can be deposited.
     function maxDeposit(address /* receiver */) public view virtual returns (uint256) {
         CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
-        uint256 netAssets = totalAssets();
+        uint256 realized = S.realizedAssets;
         uint256 _depositLimit = S.depositLimit;
-        if (netAssets >= _depositLimit) return 0;
+        if (realized >= _depositLimit) return 0;
 
-        return (_depositLimit - netAssets);
+        return (_depositLimit - realized);
     }
 
     /// @notice Returns the maximum shares that can be minted for the given receiver.
@@ -225,21 +245,14 @@ abstract contract CeresBaseVault is
     /// @return Maximum assets withdrawable.
     function maxWithdraw(address owner_) public view virtual returns (uint256) {
         (uint256 claimableShares, uint256 pps) = _getClaimableShares(owner_);
-        if (claimableShares == 0) return 0;
         return _sharesToAssetsAtPrice(claimableShares, pps, Math.Rounding.Floor);
     }
 
     /// @notice Returns the maximum shares redeemable by `owner_` from a claimable request.
-    /// @dev Capped by `redeemLimitShares` if set.
     /// @param owner_ The address that owns the claimable request.
-    /// @return Maximum shares redeemable.
-    function maxRedeem(address owner_) public view virtual returns (uint256) {
-        (uint256 claimableShares, ) = _getClaimableShares(owner_);
-        if (claimableShares == 0) return 0;
-
-        // If there is no redeem limit, user can redeem all requested shares
-        // else return the minimum of redeem limit and requested shares
-        return Math.min(claimableShares, _getCeresBaseVaultStorage().redeemLimitShares);
+    /// @return claimableShares Maximum shares redeemable.
+    function maxRedeem(address owner_) public view virtual returns (uint256 claimableShares) {
+        (claimableShares, ) = _getClaimableShares(owner_);
     }
 
     /// @notice Returns the shares that would be minted for `assets` at the current price.
@@ -292,8 +305,6 @@ abstract contract CeresBaseVault is
 
     /// @notice Withdraws `assets` from the vault using a claimable redeem request.
     /// @dev Uses the locked-in price-per-share from the processed request, not the current price.
-    /// Permissionless once the request is processed: anyone can call on behalf of `controller`
-    /// provided the receiver is the controller when the caller is not the controller.
     /// @param assets The amount of underlying asset to withdraw.
     /// @param receiver Address that receives the assets.
     /// @param controller The address that owns the claimable request.
@@ -303,10 +314,8 @@ abstract contract CeresBaseVault is
         address receiver,
         address controller
     ) public virtual nonReentrant returns (uint256) {
-        // When the caller is not the controller, enforce that the controller receives the claim
-        // This design lets anyone execute the claim for the controller
-        // making the claim process permissionless once it has been processed
-        if (msg.sender != controller && receiver != controller) revert LibError.Unauthorized();
+        // Enforce that only the controller can claim their processed withdrawal
+        if (msg.sender != controller) revert LibError.Unauthorized();
 
         (uint256 claimableShares, uint256 pps) = _getClaimableShares(controller);
         if (claimableShares == 0) revert LibError.WithdrawalNotReady();
@@ -321,8 +330,6 @@ abstract contract CeresBaseVault is
 
     /// @notice Redeems `shares` from a claimable request and sends assets to `receiver`.
     /// @dev Uses the locked-in price-per-share from the processed request.
-    /// Permissionless once the request is processed: anyone can call on behalf of `controller`
-    /// provided the receiver is the controller when the caller is not the controller.
     /// @param shares Number of shares to redeem.
     /// @param receiver Address that receives the underlying assets.
     /// @param controller The address that owns the claimable request.
@@ -332,10 +339,8 @@ abstract contract CeresBaseVault is
         address receiver,
         address controller
     ) public virtual nonReentrant returns (uint256) {
-        // When the caller is not the controller, enforce that the controller receives the claim
-        // This design lets anyone execute the claim for the controller
-        // making the claim process permissionless once it has been processed
-        if (msg.sender != controller && receiver != controller) revert LibError.Unauthorized();
+        // Enforce that only the controller can claim their processed withdrawal
+        if (msg.sender != controller) revert LibError.Unauthorized();
 
         (uint256 claimableShares, uint256 pps) = _getClaimableShares(controller);
         if (claimableShares == 0) revert LibError.WithdrawalNotReady();
@@ -356,6 +361,7 @@ abstract contract CeresBaseVault is
     /// in the vault contract until the request is processed by a keeper.
     /// @dev A user may only have one pending request at a time. Concurrent requests for the same
     /// `currentRequestId` are batched together.
+    /// @dev Capped by `redeemLimitShares` if set.
     /// @param shares Number of shares to redeem.
     /// @param controller Address that will be able to claim the redeemed assets.
     /// @param owner_ Address whose shares are burned (caller must be owner or approved).
@@ -373,12 +379,8 @@ abstract contract CeresBaseVault is
             _spendAllowance(owner_, msg.sender, shares);
         }
 
-        // Lock the requested shares in the strategy contract until the request is processed.
-        // Instead of using approve + transferFrom to move and lock the shares,
-        // we burn them from the user and mint an equivalent amount to the strategy contract.
-        // This approach tracks locked shares without requiring extra approvals or transfers to the vault.
-        _burn(owner_, shares);
-        _mint(address(this), shares);
+        // Transfer the shares from the user address to the contract to lock them until the request is processed.
+        _transfer(owner_, address(this), shares);
 
         requestId = S.currentRequestId;
 
@@ -451,17 +453,23 @@ abstract contract CeresBaseVault is
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice Processes the current batch redeem request by setting a price-per-share and reserving assets.
-    /// @dev Calls `_onProcessRequest` hook first (harvest/report for strategies, refresh for multi-vault).
-    /// Attempts to free funds via `_freeFunds` if insufficient idle assets exist. Validates max loss.
+    /// @dev Calls `_beforeProcessReport()` hook first (used in LeveragedStrategy child contract to implement keeper delay)
+    ///  and then `_processReport()` to refresh accounting, charge performance fees, and update the profit-unlock
+    /// buffer before settlement. Attempts to free funds via `_freeFunds` if insufficient idle assets
+    /// exist. Validates max loss.
     /// @param extraData Protocol-specific data forwarded to `_freeFunds` (e.g. swap and flash loan calldata).
+    /// In case of leveraged strategy, this is
+    /// extraData: abi.encode(uint256 flashLoanAmount, bytes flashLoanSwapData, bytes collateralToAssetSwapData)
     function processCurrentRequest(bytes calldata extraData) external virtual nonReentrant onlyRole(KEEPER_ROLE) {
         CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
 
-        // Pre-Processing Hook
-        // Delegates to the child contract to update state before processing the current request.
-        // For Yield Strategies: Calls _harvestAndReport() to compound yield and charge performance fees.
-        // For Multi-Strategy Vaults: Syncs aggregate TVL or handles custom multi-allocator logic.
-        _onProcessRequest(extraData);
+        // Pre-report hook: (LeveragedStrategy implements the keeper delay here).
+        // Default implementation is a no-op.
+        _beforeProcessReport();
+
+        // Unified report: refreshes realizedAssets, computes profit/loss, charges performance
+        // fees, and updates the profit-unlock buffer.
+        _processReport();
 
         // Cache currentRequestId to avoid multiple SLOADs
         uint256 _currentRequestId = S.currentRequestId;
@@ -471,30 +479,62 @@ abstract contract CeresBaseVault is
         if (request.totalShares == 0) revert LibError.NoRequestsToProcess();
 
         uint256 expectedAssets = _convertToAssets(request.totalShares, Math.Rounding.Floor);
+        uint256 grossAssetBalance = _getSelfBalance(S.asset);
 
         // Available assets = contract balance minus assets reserved for processed withdrawals
-        uint256 availableAssets = _getSelfBalance(S.asset) - S.withdrawalReserve;
+        uint256 availableAssets = grossAssetBalance - S.withdrawalReserve;
 
         uint256 assetsAllocatedForRequest;
+        // Use Top-Down accounting for loss-calculation during unwind:
+        // Any drop in net assets across `_freeFunds` (slippage, FL fees, oracle/AMM divergence, deleveraging cost)
+        //  is borne by the withdrawing user, not the remaining holders.
+        // The baseline (`realizedAssets`) is then reduced by the exact change
+        // so the next `_processReport` reports zero phantom PnL.
+        uint256 unwindLoss;
 
         // For Strategies, if required assets are more than available, try to free the required amount using _freeFunds()
         // otherwise, we have enough available assets to cover the request
         // For a multi-strategy vault, it is dependent on keepers having already pulled funds from allocated strategies
         // into this contract by calling requestRedeem and redeem functions
-        // _freeFunds returns 0 for multi-strategy vaults, as it cannot pull funds directly from async strategies
+        // _freeFunds is a no-op for multi-strategy vaults, as it cannot pull funds directly from async strategies
 
         if (expectedAssets > availableAssets) {
             uint256 amountToFree = expectedAssets - availableAssets;
 
-            // For a multi-strategy async vault, this will return 0 as it cannot synchronously pull funds from allocated strategies
-            uint256 actualReceived = _freeFunds(amountToFree, extraData);
-            assetsAllocatedForRequest = availableAssets + actualReceived;
+            // `netAssetsBefore` is the just-refreshed `realizedAssets` from `_processReport()` above;
+            // reusing it avoids a redundant oracle/market read.
+            uint256 netAssetsBefore = S.realizedAssets;
+            uint256 assetBalanceBefore = grossAssetBalance;
+
+            // For a multi-strategy async vault, this is a no-op as it cannot synchronously pull funds from allocated strategies.
+            // Return value is intentionally ignored: net asset and balance deltas below are the source of truth.
+            _freeFunds(amountToFree, extraData);
+
+            uint256 netAssetsAfter = _reportTotalAssets();
+            uint256 assetBalanceAfter = _getSelfBalance(S.asset);
+
+            // Total cost of the unwind in net-asset terms (slippage + FL fees(if any) + oracle/AMM divergence).
+            // A profitable unwind (e.g. positive slippage, exactIn buffer or favorable oracle move)
+            // contributes 0 here and surfaces as positive PnL on the next harvest.
+            unwindLoss = netAssetsBefore > netAssetsAfter ? netAssetsBefore - netAssetsAfter : 0;
+
+            // Assets actually freed into idle balance during this call.
+            // `withdrawalReserve` does not mutate between snapshots, so the raw balance delta is correct.
+            uint256 actualFreed = assetBalanceAfter - assetBalanceBefore;
+
+            // Withdrawing user absorbs `unwindLoss` from their expectation.
+            uint256 expectedAfterLoss = expectedAssets > unwindLoss ? expectedAssets - unwindLoss : 0;
+
+            // Cap by physical cash on hand (LTV/partial-unwind paths may free less than `expectedAfterLoss`).
+            assetsAllocatedForRequest = Math.min(availableAssets + actualFreed, expectedAfterLoss);
         } else {
             assetsAllocatedForRequest = expectedAssets;
         }
 
         // Max loss check
-        // Validate that actual assets allocated for the request is within maxLoss threshold
+        // Validate that actual assets allocated for the request is within maxLoss threshold.
+        // The gap below `expectedAssets` reflects the full cost the user needs to absorb
+        // (slippage + FL fees + oracle/AMM divergence).
         if (assetsAllocatedForRequest < expectedAssets) {
             uint256 loss = expectedAssets - assetsAllocatedForRequest;
             if (loss.mulDiv(BPS_PRECISION, expectedAssets) > S.maxLossBps) {
@@ -502,10 +542,12 @@ abstract contract CeresBaseVault is
             }
         }
 
+        uint256 ONE_TOKEN_UNIT = 10 ** decimals();
+
         // Price per share is calculated based on the total shares and assets allocated for this request
         // Assets allocated to this request = the idle assets allocated + Actual assets freed from the strategy
         // This is because the actual assets freed could be less than required assets due to slippage
-        uint256 pps = assetsAllocatedForRequest.mulDiv(10 ** decimals(), request.totalShares, Math.Rounding.Floor);
+        uint256 pps = assetsAllocatedForRequest.mulDiv(ONE_TOKEN_UNIT, request.totalShares, Math.Rounding.Floor);
         if (pps == 0) revert LibError.ExceededMaxLoss();
 
         request.pricePerShare = pps.toUint128();
@@ -514,7 +556,7 @@ abstract contract CeresBaseVault is
         // Adding `assetsAllocatedForRequest` directly would trap up to `totalShares / 10**decimals`
         // in the reserve due to truncation (which can be meaningful for low-decimal tokens like USDC).
         // By adding only `exactRequiredAssets`, the dust remains in `totalAssets` as profit.
-        uint256 exactRequiredAssets = uint256(request.totalShares).mulDiv(pps, 10 ** decimals(), Math.Rounding.Floor);
+        uint256 exactRequiredAssets = uint256(request.totalShares).mulDiv(pps, ONE_TOKEN_UNIT, Math.Rounding.Floor);
         S.withdrawalReserve += exactRequiredAssets.toUint128();
 
         // The shares for processed requests are burned.
@@ -525,7 +567,15 @@ abstract contract CeresBaseVault is
 
         // requestId cannot realistically overflow uint128, SafeCast.toUint128 is not required here
         S.currentRequestId = uint128(_currentRequestId + 1);
-        S.totalAssets = _reportTotalAssets();
+
+        // Reduce `realizedAssets` by the exact net-asset change caused by
+        // this request:
+        // - The assets allocated to the user (now sitting in `withdrawalReserve` and
+        // outside `_reportTotalAssets`)
+        // - The `unwindLoss` consumed by the unwind.
+        // This makes the next `_processReport` see a baseline that matches actuals,
+        // so no phantom profit/loss is reported.
+        S.realizedAssets -= (assetsAllocatedForRequest + unwindLoss).toUint128();
 
         emit RequestProcessed(_currentRequestId, request.totalShares, pps);
     }
@@ -540,26 +590,43 @@ abstract contract CeresBaseVault is
         onlyRole(KEEPER_ROLE)
         returns (uint256 profit, uint256 loss)
     {
-        return _harvestAndReport();
+        return _processReport();
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////
     //                           EXTERNAL FUNCTIONS: ADMIN FUNCTIONS                             //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Updates vault fee and slippage configuration.
-    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`, can only be updated after a delay
+    /// @notice Updates vault fee, slippage, and profit-unlock configuration.
+    /// @dev Gated by `TIMELOCKED_ADMIN_ROLE`, can only be updated after a delay.
+    /// Before updating `profitUnlockPeriod`, the still-locked portion of `lockedProfit` is
+    /// settled via `_settleLockedProfit()` so that already-unlocked yield stays unlocked
+    /// and the remaining buffer simply re-decays from `block.timestamp` over the new
+    /// period. This eliminates both flash-up (period decrease/disable) and flash-down (period
+    /// increase) jumps in `totalAssets()` across the config change.
+    /// For instant unlocks for future harvests, set the `_profitUnlockPeriod = 0`
+    /// To avoid a JIT-attackable yield bump from any in-flight buffer, admins should ramp the
+    /// period down gradually rather than jumping straight to 0
     /// @param _maxSlippageBps Maximum allowed swap slippage in basis points.
     /// @param _performanceFeeBps Performance fee rate in basis points.
     /// @param _maxLossBps Maximum tolerated loss when processing a redeem batch, in basis points.
+    ///        This bounds the *total* user-visible shortfall: swap slippage + flashloan fees + oracle/AMM
+    ///        divergence (e.g., Oracle lag vs AMM execution price). Must be set to cover all three components
     /// @param _performanceFeeRecipient Address that receives minted performance fee shares. Set to address(0) to disable fees.
+    /// @param _profitUnlockPeriod Linear decay period (seconds) for harvested profit. Must not exceed `MAX_PROFIT_UNLOCK_PERIOD`. Set to 0 to disable the unlock buffer (instant unlocks).
     function updateConfig(
         uint16 _maxSlippageBps,
         uint16 _performanceFeeBps,
         uint16 _maxLossBps,
-        address _performanceFeeRecipient
+        address _performanceFeeRecipient,
+        uint32 _profitUnlockPeriod
     ) external virtual onlyRole(TIMELOCKED_ADMIN_ROLE) {
-        if (_maxSlippageBps > MAX_FEE || _performanceFeeBps > MAX_FEE || _maxLossBps > MAX_FEE) {
+        if (
+            _maxSlippageBps > MAX_FEE ||
+            _performanceFeeBps > MAX_FEE ||
+            _maxLossBps > MAX_FEE ||
+            _profitUnlockPeriod > MAX_PROFIT_UNLOCK_PERIOD
+        ) {
             revert LibError.InvalidValue();
         }
 
@@ -568,6 +635,11 @@ abstract contract CeresBaseVault is
         S.performanceFeeBps = _performanceFeeBps;
         S.maxLossBps = _maxLossBps;
         S.performanceFeeRecipient = _performanceFeeRecipient;
+
+        if (_profitUnlockPeriod != S.profitUnlockPeriod) {
+            _settleLockedProfit();
+            S.profitUnlockPeriod = _profitUnlockPeriod;
+        }
 
         emit ConfigUpdated();
     }
@@ -642,6 +714,7 @@ abstract contract CeresBaseVault is
     /// @return lastReportTimestamp The timestamp of the last strategy harvest execution.
     /// @return performanceFeeRecipient The receiver address of harvested fees.
     /// @return roleManager Address of the role manager.
+    /// @return profitUnlockPeriod Linear decay period (seconds) for harvested profit.
     function getConfig()
         external
         view
@@ -652,7 +725,8 @@ abstract contract CeresBaseVault is
             uint16 maxLossBps,
             uint48 lastReportTimestamp,
             address performanceFeeRecipient,
-            address roleManager
+            address roleManager,
+            uint32 profitUnlockPeriod
         )
     {
         CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
@@ -662,6 +736,25 @@ abstract contract CeresBaseVault is
         lastReportTimestamp = S.lastReportTimestamp;
         performanceFeeRecipient = S.performanceFeeRecipient;
         roleManager = address(S.roleManager);
+        profitUnlockPeriod = S.profitUnlockPeriod;
+    }
+
+    /// @notice Returns the current state of the linear profit-unlock buffer.
+    /// @return lockedProfit The full buffer recorded at the last report (uint128).
+    /// @return lastProfitReport The timestamp of the last `_updateLockedProfit` write.
+    /// @return profitUnlockPeriod The configured linear decay window in seconds.
+    /// @return currentlyLocked The portion of `lockedProfit` still locked at the current block.
+    function getProfitUnlockState()
+        external
+        view
+        virtual
+        returns (uint128 lockedProfit, uint40 lastProfitReport, uint32 profitUnlockPeriod, uint256 currentlyLocked)
+    {
+        CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
+        lockedProfit = S.lockedProfit;
+        lastProfitReport = S.lastProfitReport;
+        profitUnlockPeriod = S.profitUnlockPeriod;
+        currentlyLocked = _calculateLockedProfit();
     }
 
     /// @notice Returns cumulative and snapshot net profit trackers used for performance fee accounting.
@@ -707,7 +800,7 @@ abstract contract CeresBaseVault is
         S.asset.safeTransferFrom(caller, address(this), assets);
 
         _deployFunds(assets);
-        S.totalAssets += assets;
+        S.realizedAssets += assets;
 
         _mint(receiver, shares);
 
@@ -733,10 +826,12 @@ abstract contract CeresBaseVault is
         uint256 currentAssets = _getSelfBalance(S.asset);
         if (currentAssets < assets) revert LibError.InsufficientAssets();
 
-        S.userRedeemRequests[owner_].shares -= shares.toUint128();
-        if (S.userRedeemRequests[owner_].shares == 0) {
+        UserRedeemRequest storage userRequest = S.userRedeemRequests[owner_];
+
+        userRequest.shares -= shares.toUint128();
+        if (userRequest.shares == 0) {
             // Reset requestId to 0 when there are no pending shares
-            S.userRedeemRequests[owner_].requestId = 0;
+            userRequest.requestId = 0;
         }
 
         S.withdrawalReserve -= assets.toUint128();
@@ -756,16 +851,26 @@ abstract contract CeresBaseVault is
     //                             INTERNAL HELPER FUNCTIONS                                     //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @dev Re-reads totalAssets from the underlying protocol and updates stored state.
-    /// @return prevAssets The stored total assets before the refresh.
-    /// @return currentAssets The newly computed total assets.
-    function _refreshTotalAssets() internal virtual returns (uint256 prevAssets, uint256 currentAssets) {
+    /// @dev Returns the portion of the most recently locked profit that is still locked at the current
+    /// block, decaying linearly from `lockedProfit` at `lastProfitReport` to zero at
+    /// `lastProfitReport + profitUnlockPeriod`.
+    /// Returns 0 in the disabled state (`profitUnlockPeriod == 0`) and after full decay.
+    /// @return The amount of profit still locked, denominated in underlying assets.
+    function _calculateLockedProfit() internal view returns (uint256) {
         CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
-        prevAssets = S.totalAssets;
-        currentAssets = _reportTotalAssets();
+        uint256 locked = S.lockedProfit;
+        uint256 period = S.profitUnlockPeriod;
 
-        S.totalAssets = currentAssets;
-        S.lastReportTimestamp = uint40(block.timestamp);
+        // Disabled (period == 0) results in instant profit unlocks.
+        if (locked == 0 || period == 0) return 0;
+
+        // lastProfitReport is only ever set to block.timestamp by _updateLockedProfit, so
+        // (block.timestamp - lastProfitReport) cannot underflow.
+        uint256 elapsed = block.timestamp - S.lastProfitReport;
+        if (elapsed >= period) return 0;
+
+        // remaining = locked * (period - elapsed) / period
+        return locked.mulDiv(period - elapsed, period);
     }
 
     /// @dev Computes profit/loss from an asset change and updates the cumulative net profit tracker.
@@ -804,15 +909,31 @@ abstract contract CeresBaseVault is
         }
     }
 
-    /// @dev Refreshes total assets, calculates profit/loss, and mints performance fee shares.
+    /// @dev Refreshes the stored `realizedAssets` value and updates `lastReportTimestamp` to `block.timestamp`.
+    /// Returns the previous and newly stored asset values so callers can compute their own profit/loss.
+    /// @return prevAssets The `realizedAssets` value before the refresh.
+    /// @return currentAssets The newly stored `realizedAssets` value.
+    function _refreshRealizedAssets() internal returns (uint256 prevAssets, uint256 currentAssets) {
+        CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
+        prevAssets = S.realizedAssets;
+        currentAssets = _reportTotalAssets();
+        S.realizedAssets = currentAssets;
+        S.lastReportTimestamp = uint40(block.timestamp);
+    }
+
+    /// @dev Unified reporting pipeline. Refreshes realizedAssets from the underlying protocol,
+    /// computes profit/loss against the prior baseline, and charges performance fees on chargeable
+    /// profit. Invoked by the external `harvestAndReport()` keeper entrypoint and by `processCurrentRequest()`
+    /// after `_beforeProcessReport()` and before settlement. Inherited contracts MAY override the body (e.g.
+    /// MultiStrategyVault skips PnL accumulation).
     /// @return profit Gross profit since the last report.
     /// @return loss Gross loss since the last report.
-    function _harvestAndReport() internal virtual returns (uint256 profit, uint256 loss) {
-        (uint256 prevAssets, uint256 currentAssets) = _refreshTotalAssets();
+    function _processReport() internal virtual returns (uint256 profit, uint256 loss) {
+        (uint256 prevAssets, uint256 currentAssets) = _refreshRealizedAssets();
 
         // Skip profit/loss tracking and fee logic when nothing changed
         if (prevAssets == currentAssets) {
-            emit StrategyReported(msg.sender, 0, 0, 0);
+            emit Reported(msg.sender, 0, 0, 0);
             return (0, 0);
         }
 
@@ -820,7 +941,83 @@ abstract contract CeresBaseVault is
         (profit, chargeableProfit, loss) = _calculateProfitOrLoss(prevAssets, currentAssets);
 
         uint256 performanceFees = _chargeFees(chargeableProfit, currentAssets);
-        emit StrategyReported(msg.sender, profit, loss, performanceFees);
+        _updateLockedProfit(profit, performanceFees, loss);
+        emit Reported(msg.sender, profit, loss, performanceFees);
+    }
+
+    /// @dev Updates the still-locked portion of `lockedProfit` to its current decayed value and
+    /// refreshes the `lastProfitReport` to `block.timestamp`. Safe to call when no profit is locked
+    /// Used by `updateConfig` before updating the setting `profitUnlockPeriod` so that:
+    ///   - Already-unlocked yield (visible in `totalAssets()`) stays unlocked.
+    ///   - The remaining buffer re-decays linearly from `now` over the new period.
+    function _settleLockedProfit() internal {
+        CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
+        if (S.lockedProfit == 0) return;
+
+        uint128 stillLocked = uint128(_calculateLockedProfit());
+        S.lockedProfit = stillLocked;
+        S.lastProfitReport = uint40(block.timestamp);
+        emit ProfitLocked(stillLocked);
+    }
+
+    /// @dev Updates the linear profit unlock buffer to absorb the loss against any still-locked
+    /// profit first, then adds profitAfterFees to the buffer and resets the linear-decay clock.
+    /// When `profitUnlockPeriod == 0`, profit is never locked (instant unlock); this function still
+    /// runs the loss-absorption math harmlessly because `_calculateLockedProfit` returns 0.
+    /// @param profit Gross profit reported by `_processReport`.
+    /// @param performanceFees Asset-denominated fees minted as shares to the fee recipient.
+    /// @param loss Gross loss reported by `_processReport`.
+    function _updateLockedProfit(uint256 profit, uint256 performanceFees, uint256 loss) internal virtual {
+        CeresBaseVaultStorage storage S = _getCeresBaseVaultStorage();
+
+        uint256 currentLockedProfit = _calculateLockedProfit();
+
+        if (loss > 0) {
+            uint256 lossAbsorbed = loss < currentLockedProfit ? loss : currentLockedProfit;
+            currentLockedProfit -= lossAbsorbed;
+        }
+
+        uint256 profitAfterFees;
+        if (profit > 0) {
+            // performanceFees <= chargeableProfit <= profit, so this never underflows.
+            profitAfterFees = profit - performanceFees;
+        }
+
+        uint256 newLockedProfit = currentLockedProfit + profitAfterFees;
+
+        // Weighted re-anchor: instead of pinning `lastProfitReport = now` on every call (which results in the unlock
+        // clock indefinitely refreshed with harvests), advance the anchor partially using weighted approach
+        // The updated value is based on the proportion of how much *new* profit is being mixed into the
+        // existing still-decaying buffer.
+        //
+        //     newElapsed = currentLockedProfit * (now - lastProfitReport) / newLockedProfit
+        //     newAnchor  = now - newElapsed
+        //
+        // Properties:
+        //   - profitAfterFees == 0           -> newElapsed = (now - lastProfitReport), anchor unchanged
+        //                                       (loss-only and dust-only calls cannot grief the clock).
+        //   - currentLockedProfit == 0       -> newElapsed = 0, anchor = now (first harvest / fully
+        //                                       decayed buffer / disabled period: same as before).
+        //   - profitAfterFees is very small vs currentLockedProfit -> newElapsed ~ elapsed,
+        //                       anchor barely moves (old residue dominates, decay continues undisturbed).
+        //   - profitAfterFees >> currentLockedProfit -> newElapsed ~ 0, anchor ~ now (big harvest dominates).
+        //   - Old residue's unlock end-time can extend by at most
+        //     `(now - lastProfitReport) * profitAfterFees / newLockedProfit`,
+        //     strictly less than the current code's full `(now - lastProfitReport)` extension.
+        if (newLockedProfit == 0) {
+            // No need to update `lastProfitReport`: `_calculateLockedProfit` returns early
+            // when `lockedProfit == 0`, so the anchor is never read until the next profitable harvest,
+            // which will write it fresh.
+            S.lockedProfit = 0;
+        } else {
+            uint256 elapsed = block.timestamp - S.lastProfitReport;
+            uint256 newElapsed = currentLockedProfit.mulDiv(elapsed, newLockedProfit);
+
+            S.lockedProfit = newLockedProfit.toUint128();
+            S.lastProfitReport = uint40(block.timestamp - newElapsed);
+        }
+
+        emit ProfitLocked(newLockedProfit);
     }
 
     /// @dev Mints performance fee shares to the fee recipient proportional to `chargeableProfit`.
@@ -839,6 +1036,8 @@ abstract contract CeresBaseVault is
         performanceFees = chargeableProfit.mulDiv(performanceFeeBps, BPS_PRECISION, Math.Rounding.Ceil);
 
         // Calculate shares to mint such that fee recipient gets performanceFees worth of assets
+        // Underflow or Division by 0 is highly unlikely.
+        // If it happens (edge case), tx reverts safely and can be mitigated by MANAGEMENT
         uint256 performanceFeeShares = performanceFees.mulDiv(
             totalSupply(),
             currentAssets - performanceFees,
@@ -851,6 +1050,7 @@ abstract contract CeresBaseVault is
 
     /// @dev Returns claimable shares and the locked-in price-per-share for a controller's active request.
     /// Returns (0, 0) if the request has not been processed yet.
+    /// @dev Capped by `redeemLimitShares`
     /// @param controller The user whose claimable shares are queried.
     /// @return claimableShares The amount of shares claimable.
     /// @return pricePerShare The locked-in price per share.
@@ -865,7 +1065,10 @@ abstract contract CeresBaseVault is
         // and no shares are claimable (all shares are still pending or there is no request)
         if (details.pricePerShare == 0) return (0, 0);
 
-        claimableShares = userRequest.shares;
+        // User can redeem the minimum of redeem limit and requested shares
+        // `redeemLimitShares` is a hard per-controller cap on claimable shares.
+        // A value of 0 is contract default, and can also be used later to pause claims
+        claimableShares = Math.min(userRequest.shares, S.redeemLimitShares);
         pricePerShare = details.pricePerShare;
     }
 
@@ -936,10 +1139,9 @@ abstract contract CeresBaseVault is
     //                                   VIRTUAL FUNCTIONS                                       //
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @dev Hook to execute any logic required before processing a batch request.
-    /// Inherited contracts should use this to harvest rewards and charge performance fees.
-    /// @param extraData Encoded metadata needed for processing.
-    function _onProcessRequest(bytes calldata extraData) internal virtual;
+    /// @dev Hook invoked at the start of `processCurrentRequest`, immediately before
+    /// the `_processReport()` call. Default implementation is a no-op.
+    function _beforeProcessReport() internal virtual {}
 
     /// @dev Deploys assets into the underlying protocol or child strategies after a deposit.
     /// @param _amount The amount of underlying assets to deploy.
@@ -952,8 +1154,12 @@ abstract contract CeresBaseVault is
     function _reportTotalAssets() internal virtual returns (uint256 _totalAssets);
 
     /// @dev Attempts to withdraw `_amount` from the underlying protocol to cover a redeem request.
+    /// @dev NOTE: Implementations are blind execution hooks. The actual cash freed and any
+    /// associated unwind cost are measured top-down by `processCurrentRequest` via
+    /// `_reportTotalAssets()` and idle-balance snapshots taken around this call. Implementations
+    /// MUST NOT mutate `withdrawalReserve` or `realizedAssets` and SHOULD avoid emitting any
+    /// state that the top-down accounting depends on.
     /// @param _amount The amount of underlying assets to free.
     /// @param extraData Encoded specific extra instructions / metadata.
-    /// @return actualFreed The actual amount freed (may be less than `_amount` due to slippage).
-    function _freeFunds(uint256 _amount, bytes calldata extraData) internal virtual returns (uint256 actualFreed);
+    function _freeFunds(uint256 _amount, bytes calldata extraData) internal virtual;
 }

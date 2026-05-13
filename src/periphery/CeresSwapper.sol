@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: AGPL-3.0
-pragma solidity 0.8.28;
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -115,6 +115,7 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         bytes calldata swapData
     ) external onlyRole(VAULT_OR_STRATEGY) nonReentrant returns (uint256 tokensReceived) {
         if (amountIn == 0) return 0;
+        if (fromToken == toToken) revert LibError.InvalidToken();
 
         // Determine the swap provider and router for the swap
         bytes32 tokenPairHash = getTokenPairHash(fromToken, toToken);
@@ -141,7 +142,7 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         }
 
         tokensReceived = IERC20(toToken).balanceOf(address(this)) - balanceBefore;
-        if (tokensReceived < minAmountOut) revert LibError.SlippageLimitExceeded(tokensReceived, minAmountOut);
+        if (tokensReceived < minAmountOut) revert LibError.SlippageLimitExceeded(minAmountOut, tokensReceived);
 
         IERC20(toToken).safeTransfer(receiver, tokensReceived);
         emit SwapExecuted(fromToken, toToken, amountIn, tokensReceived, receiver);
@@ -165,6 +166,7 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         bytes calldata swapData
     ) external onlyRole(VAULT_OR_STRATEGY) nonReentrant returns (uint256 actualAmountIn) {
         if (amountOut == 0 || maxAmountIn == 0) return 0;
+        if (fromToken == toToken) revert LibError.InvalidToken();
 
         SwapProvider memory provider;
         {
@@ -202,7 +204,7 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         {
             // Validate the actual tokens received and transfer tokens to the receiver
             uint256 tokensReceived = IERC20(toToken).balanceOf(address(this)) - toTokenBalanceBefore;
-            if (tokensReceived < amountOut) revert LibError.SlippageLimitExceeded(tokensReceived, amountOut);
+            if (tokensReceived < amountOut) revert LibError.SlippageLimitExceeded(amountOut, tokensReceived);
             IERC20(toToken).safeTransfer(receiver, tokensReceived);
         }
 
@@ -227,6 +229,8 @@ contract CeresSwapper is ReentrancyGuardTransient, ICeresSwapper {
         SwapProvider calldata _provider
     ) external onlyRole(MANAGEMENT_ROLE) {
         if (_fromToken == address(0) || _toToken == address(0)) revert LibError.InvalidAddress();
+        if (_fromToken == _toToken) revert LibError.InvalidToken();
+
         if (_provider.router == address(0)) revert LibError.InvalidSwapConfig();
         bytes32 tokenPairHash = getTokenPairHash(_fromToken, _toToken);
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
@@ -22,12 +22,18 @@ contract LeveragedSilo is LeveragedStrategy {
     ///////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @custom:storage-location erc7201:ceres.storage.LeveragedSilo
+    // prettier-ignore
     struct LeveragedSiloStorage {
-        ISiloLens siloLens;
-        ISiloConfig siloConfig;
+        // Slot 0: 160 + 8 = 168 bits (88 bits free)
+        // Co-read in _depositCollateral and _withdrawCollateral
         ISilo depositSilo;
-        ISilo borrowSilo;
         ISilo.CollateralType collateralType;
+
+        // Slot 1: 160 bits (96 bits free)
+        ISilo borrowSilo;
+
+        // Slot 2: 160 bits (96 bits free)
+        ISiloLens siloLens;
     }
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.LeveragedSilo")) - 1)) & ~bytes32(uint256(0xff))
@@ -90,9 +96,8 @@ contract LeveragedSilo is LeveragedStrategy {
         LeveragedSiloStorage storage S = _getLeveragedSiloStorage();
 
         S.siloLens = ISiloLens(_siloLens);
-        S.siloConfig = ISiloConfig(_siloMarket);
 
-        (address _silo0, address _silo1) = S.siloConfig.getSilos();
+        (address _silo0, address _silo1) = ISiloConfig(_siloMarket).getSilos();
 
         // Determine and set the deposit and borrow silos
         if (_collateralToken == ISilo(_silo0).asset()) {
@@ -121,24 +126,16 @@ contract LeveragedSilo is LeveragedStrategy {
 
     /// @notice Returns the current Silo market configuration for this strategy.
     /// @return siloLens Address of the SiloLens contract.
-    /// @return siloConfig Address of the SiloConfig contract.
     /// @return depositSilo Address of the silo used for collateral deposits.
     /// @return borrowSilo Address of the silo used for borrowing.
     /// @return collateralType Deposit collateral type: Protected or standard Collateral.
     function getMarketDetails()
         external
         view
-        returns (
-            address siloLens,
-            address siloConfig,
-            address depositSilo,
-            address borrowSilo,
-            ISilo.CollateralType collateralType
-        )
+        returns (address siloLens, address depositSilo, address borrowSilo, ISilo.CollateralType collateralType)
     {
         LeveragedSiloStorage storage S = _getLeveragedSiloStorage();
         siloLens = address(S.siloLens);
-        siloConfig = address(S.siloConfig);
         depositSilo = address(S.depositSilo);
         borrowSilo = address(S.borrowSilo);
         collateralType = S.collateralType;
@@ -222,15 +219,5 @@ contract LeveragedSilo is LeveragedStrategy {
         // To convert it to BPS, ltv_bps = (maxLtv * BPS_PRECISION) / 1e18
         uint256 maxLtv = _getMaxLtv();
         maxLtvBps = maxLtv.mulDiv(BPS_PRECISION, 1e18, Math.Rounding.Floor).toUint16();
-    }
-
-    /// @dev Rejects rescue of Silo share tokens (the silo contracts are themselves the share
-    /// tokens). Both are ERC4626-style transferable shares that represent the strategy's deposit
-    /// and borrow positions
-    function _validateRescueToken(address _token) internal view override {
-        LeveragedSiloStorage storage S = _getLeveragedSiloStorage();
-        if (_token == address(S.depositSilo) || _token == address(S.borrowSilo)) {
-            revert LibError.InvalidToken();
-        }
     }
 }

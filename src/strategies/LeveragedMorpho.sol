@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.28;
+pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin-contracts/utils/math/Math.sol";
@@ -35,9 +35,10 @@ contract LeveragedMorpho is LeveragedStrategy {
         // As we already store collateralToken and loanToken in LeveragedStrategy, we can use existing fields
         // from LeveragedStrategy storage and only store oracle, irm, lltv in LeveragedMorphoStorage.
         // This approach saves 2 storage slots and avoids 2 cold SLOADs (4.2k gas) during runtime
+        // Packing LLTV with IRM in a single slot saves a storage slot 
         address morphoOracle;
         address morphoIrm;
-        uint256 morphoLltv;
+        uint96 morphoLltv;
     }
 
     // keccak256(abi.encode(uint256(keccak256("ceres.storage.LeveragedMorpho")) - 1)) & ~bytes32(uint256(0xff))
@@ -100,7 +101,7 @@ contract LeveragedMorpho is LeveragedStrategy {
 
         S.morphoOracle = _oracle;
         S.morphoIrm = _irm;
-        S.morphoLltv = _lltv;
+        S.morphoLltv = _lltv.toUint96();
 
         S.marketId = MarketParams({
             collateralToken: _collateralToken,
@@ -130,7 +131,7 @@ contract LeveragedMorpho is LeveragedStrategy {
                 loanToken: address(DEBT_TOKEN()),
                 oracle: S.morphoOracle,
                 irm: S.morphoIrm,
-                lltv: S.morphoLltv
+                lltv: uint256(S.morphoLltv)
             });
     }
 
